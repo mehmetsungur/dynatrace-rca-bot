@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: dynatrace-rca-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    healthCheckPath: /health
+    envVars:
+      - key: DT_BASE_URL
+        sync: false
+      - key: DT_API_TOKEN
+        sync: false
+      - key: CLAUDE_API_KEY
+        sync: false
+      - key: TEAMS_WEBHOOK
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
