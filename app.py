@@ -424,7 +424,6 @@ def process_problem(display_id, problem_title, state, dt_url, details_text):
     rca = ask_claude(problem, details_text, logs_data, rc_name)
     log.info("RCA OK: %s confidence=%s", display_id, rca.get("confidence"))
     card = build_teams_card(problem, rca, dt_url, rc_name, state)
-    card = build_teams_card(problem, rca, dt_url, rc_name)
     r = requests.post(
         TEAMS_WEBHOOK,
         headers={"Content-Type": "application/json"},
