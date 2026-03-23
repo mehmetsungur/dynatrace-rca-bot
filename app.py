@@ -138,7 +138,7 @@ def ask_claude(problem, details_text, logs, rc_name):
         "PROBLEM: %s | %s | Severity: %s | Status: %s\n"
         "Root Cause Service: %s | Affected: %s | Namespace: %s | Calls: %s\n\n"
         "EVIDENCE:\n%s\n\nLOGS:\n%s\n\nDETAILS:\n%s\n\n"
-        "Respond ONLY with this JSON (no extra text):\n"
+        "Respond ONLY with this JSON (no extra text). Write ALL text values in Turkish:\n"
         '{"root_cause":"2-3 sentence technical root cause",'
         '"confidence":"HIGH or MEDIUM or LOW",'
         '"hypotheses":["H1","H2","H3"],'
