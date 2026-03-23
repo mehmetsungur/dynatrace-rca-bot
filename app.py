@@ -184,14 +184,15 @@ def ask_claude(problem, details_text, logs, rc_name):
     return json.loads(raw)
 
 
-def build_teams_card(problem, rca, dt_url, rc_name):
+def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
     display_id = problem.get("displayId", "N/A")
     title = problem.get("title", "Unknown")
     status = problem.get("status", "OPEN")
     severity = problem.get("severityLevel", "")
-    state_label = "CLOSED" if status == "CLOSED" else "OPEN"
-    state_color = "good" if status == "CLOSED" else "attention"
-    state_icon = "OK" if status == "CLOSED" else "!!"
+    is_resolved = (status == "CLOSED") or (webhook_state == "RESOLVED")
+    state_label = "CLOSED" if is_resolved else "OPEN"
+    state_color = "good" if is_resolved else "attention"
+    state_icon = "OK" if is_resolved else "!!"
     root_cause = rca.get("root_cause", "Analysis incomplete.")
     confidence = rca.get("confidence", "MEDIUM")
     severity_ass = rca.get("severity_assessment", "")
@@ -422,6 +423,7 @@ def process_problem(display_id, problem_title, state, dt_url, details_text):
     log.info("Claude sorgu: %s (rc: %s)", display_id, rc_name)
     rca = ask_claude(problem, details_text, logs_data, rc_name)
     log.info("RCA OK: %s confidence=%s", display_id, rca.get("confidence"))
+    card = build_teams_card(problem, rca, dt_url, rc_name, state)
     card = build_teams_card(problem, rca, dt_url, rc_name)
     r = requests.post(
         TEAMS_WEBHOOK,
