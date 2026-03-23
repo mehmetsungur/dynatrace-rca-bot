@@ -189,7 +189,7 @@ def build_teams_card(problem, rca, dt_url, rc_name):
     title = problem.get("title", "Unknown")
     status = problem.get("status", "OPEN")
     severity = problem.get("severityLevel", "")
-    state_label = "RESOLVED" if status == "CLOSED" else "OPEN"
+    state_label = "CLOSED" if status == "CLOSED" else "OPEN"
     state_color = "good" if status == "CLOSED" else "attention"
     state_icon = "OK" if status == "CLOSED" else "!!"
     root_cause = rca.get("root_cause", "Analysis incomplete.")
