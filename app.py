@@ -92,16 +92,24 @@ def clean_placeholders(text):
 
 
 def get_root_cause_name(problem, details_text):
+    """
+    Gercek root cause SERVIS ADINI belirle (kisa, temiz ad — entity lookup icin kullanilir).
+    Oncelik: rootCauseEntity > affectedEntities[0] > details parse > problem title
+    """
+    # 1. DT API rootCauseEntity (en dogru)
     rc = (problem.get("rootCauseEntity") or {}).get("name", "")
     if rc:
         return rc
+    # 2. affectedEntities listesinin ilk elemani
     affected = problem.get("affectedEntities", [])
     if affected:
         name = affected[0].get("name", "")
         if name:
             return name
+    # 3. Details metnindeki "Root Cause: XXX" veya "Impacted: XXX" kismindan parse et
     clean = clean_placeholders(details_text)
     for part in clean.split("|"):
+        part = part.strip()
         if "Root Cause" in part:
             val = part.split(":", 1)[-1].strip().split("|")[0].strip()
             if (
@@ -110,8 +118,16 @@ def get_root_cause_name(problem, details_text):
                 and val.lower() not in ("n/a", "none", "unknown", "")
             ):
                 return val
+    # 4. Problem basligini temizle — "Failure rate increase on Web service XXX" → "XXX"
     title = problem.get("title", "")
     if title:
+        # "... on Web service SERVIS_ADI" veya "... on service SERVIS_ADI" pattern'ini temizle
+        for prefix in ("on Web service ", "on service ", "on web service "):
+            if prefix in title.lower():
+                idx = title.lower().index(prefix)
+                candidate = title[idx + len(prefix) :].strip()
+                if candidate:
+                    return candidate
         return title
     return "Unknown Service"
 
@@ -121,44 +137,59 @@ def get_root_cause_name(problem, details_text):
 
 def resolve_service_entity_id(service_name, problem=None):
     """
-    Servis entity ID'sini 3 asamali oncelik zinciriyle bul:
-      1. problem.affectedEntities[0] (en guvenilir - webhook'tan bile gelir)
-      2. problem.rootCauseEntity
+    Servis entity ID'sini bul — 4 asamali oncelik zinciri:
+      1. problem.affectedEntities[0].entityId — adi eslesmese bile kullan
+         (Webhook payload'tan bile gelir, ag baglantisindan bagimsiz)
+      2. problem.rootCauseEntity.entityId
       3. DT API entityName.equals sorgusu (fallback)
+      4. DT API entityName.contains sorgusu (son care)
     """
-    # 1. affectedEntities'in ilk ogesi - servis adi eslesiyor mu kontrol et
     if problem:
+        # 1. affectedEntities — servis adi eslesiyor mu?
         for ent in problem.get("affectedEntities", []):
-            if ent.get("name", "").lower() == service_name.lower():
-                eid = ent.get("entityId", {}).get("id", "")
-                if eid:
-                    log.info(
-                        "Entity ID affectedEntities'den alindi: %s -> %s",
-                        service_name,
-                        eid,
-                    )
-                    return eid
-        # 2. rootCauseEntity
-        rc_ent = problem.get("rootCauseEntity") or {}
-        if rc_ent.get("name", "").lower() == service_name.lower():
-            eid = rc_ent.get("entityId", {}).get("id", "")
-            if eid:
+            ent_name = ent.get("name", "")
+            eid = ent.get("entityId", {}).get("id", "")
+            if eid and ent_name.lower() == service_name.lower():
                 log.info(
-                    "Entity ID rootCauseEntity'den alindi: %s -> %s", service_name, eid
-                )
-                return eid
-        # Adi bilmiyoruz ama sadece 1 affected entity var - onu kullan
-        if len(problem.get("affectedEntities", [])) == 1:
-            eid = problem["affectedEntities"][0].get("entityId", {}).get("id", "")
-            if eid:
-                log.info(
-                    "Entity ID tek affected entity'den alindi: %s -> %s",
+                    "Entity ID affectedEntities(eslesme) ile alindi: %s -> %s",
                     service_name,
                     eid,
                 )
                 return eid
 
-    # 3. API sorgusu (fallback - ic ag erisilemezse basarisiz olabilir)
+        # affectedEntities adi eslesmedi ama tek eleman var — onu kullan
+        if len(problem.get("affectedEntities", [])) == 1:
+            eid = problem["affectedEntities"][0].get("entityId", {}).get("id", "")
+            if eid:
+                log.info(
+                    "Entity ID tek affectedEntity'den alindi: %s -> %s",
+                    service_name,
+                    eid,
+                )
+                return eid
+
+        # Birden fazla var ama hicbiri eslesmedi — hepsini logla, ilkini kullan
+        if problem.get("affectedEntities"):
+            eid = problem["affectedEntities"][0].get("entityId", {}).get("id", "")
+            if eid:
+                log.info(
+                    "Entity ID affectedEntities[0]'dan alindi (ad eslesme yok): %s -> %s",
+                    service_name,
+                    eid,
+                )
+                return eid
+
+        # 2. rootCauseEntity
+        rc_eid = (
+            (problem.get("rootCauseEntity") or {}).get("entityId", {}).get("id", "")
+        )
+        if rc_eid:
+            log.info(
+                "Entity ID rootCauseEntity'den alindi: %s -> %s", service_name, rc_eid
+            )
+            return rc_eid
+
+    # 3. API sorgusu — entityName.equals
     try:
         r = requests.get(
             DT_BASE_URL + "/api/v2/entities",
@@ -175,10 +206,41 @@ def resolve_service_entity_id(service_name, problem=None):
         items = r.json().get("entities", [])
         if items:
             eid = items[0]["entityId"]["id"]
-            log.info("Entity ID API'den alindi: %s -> %s", service_name, eid)
+            log.info("Entity ID API(equals) ile alindi: %s -> %s", service_name, eid)
             return eid
     except Exception as e:
-        log.warning("Entity ID API sorgusu basarisiz (%s): %s", service_name, e)
+        log.warning("Entity ID API(equals) basarisiz (%s): %s", service_name, e)
+
+    # 4. API sorgusu — entityName.contains (son care)
+    try:
+        # Servis adinin ilk anlamli parcasini al (port numaralarini cikar)
+        short_name = service_name.split(":")[0].split("/")[-1][:40]
+        r = requests.get(
+            DT_BASE_URL + "/api/v2/entities",
+            headers=dt_headers(),
+            params={
+                "entitySelector": 'type(SERVICE),entityName.contains("%s")'
+                % short_name,
+                "fields": "entityId,displayName",
+                "pageSize": 5,
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        items = r.json().get("entities", [])
+        if items:
+            eid = items[0]["entityId"]["id"]
+            log.info(
+                "Entity ID API(contains:%s) ile alindi: %s -> %s",
+                short_name,
+                service_name,
+                eid,
+            )
+            return eid
+    except Exception as e:
+        log.warning("Entity ID API(contains) basarisiz (%s): %s", service_name, e)
+
+    log.warning("Entity ID hic bulunamadi: %s", service_name)
     return None
 
 
@@ -679,13 +741,29 @@ def process_problem(display_id, problem_title, state, dt_url, details_text):
         problem = get_problem_details(basic_info["problemId"])
     if not problem:
         log.warning("Webhook verisi kullaniliyor: %s", display_id)
+        # Details metninden servis adini cikarmaya calis
+        fallback_name = problem_title
+        for part in clean_placeholders(details_text).split("|"):
+            part = part.strip()
+            if "Root Cause" in part:
+                val = part.split(":", 1)[-1].strip()
+                if (
+                    val
+                    and len(val) > 2
+                    and "on Web service" not in val
+                    and "{" not in val
+                ):
+                    fallback_name = val
+                    break
         problem = {
             "displayId": display_id,
             "title": problem_title,
             "status": state,
             "severityLevel": "ERROR",
             "impactLevel": "SERVICES",
-            "affectedEntities": [],
+            "affectedEntities": [
+                {"name": fallback_name, "entityId": {"id": "", "type": "SERVICE"}}
+            ],
             "rootCauseEntity": None,
         }
 
