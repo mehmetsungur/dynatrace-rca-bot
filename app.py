@@ -122,7 +122,14 @@ def get_root_cause_name(problem, details_text):
     title = problem.get("title", "")
     if title:
         # "... on Web service SERVIS_ADI" veya "... on service SERVIS_ADI" pattern'ini temizle
-        for prefix in ("on Web service ", "on service ", "on web service "):
+        for prefix in (
+            "on Web request service ",
+            "on Web service ",
+            "on request service ",
+            "on service ",
+            "on web request service ",
+            "on web service ",
+        ):
             if prefix in title.lower():
                 idx = title.lower().index(prefix)
                 candidate = title[idx + len(prefix) :].strip()
@@ -733,7 +740,15 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN", metric
 # ── ORKESTRATÖR ───────────────────────────────────────────────────────────────
 
 
-def process_problem(display_id, problem_title, state, dt_url, details_text):
+def process_problem(
+    display_id,
+    problem_title,
+    state,
+    dt_url,
+    details_text,
+    entity_id_hint="",
+    service_name_hint="",
+):
     log.info("Isleniyor: %s - %s (%s)", display_id, problem_title, state)
     basic_info = find_problem_by_display_id(display_id)
     problem = {}
@@ -741,20 +756,23 @@ def process_problem(display_id, problem_title, state, dt_url, details_text):
         problem = get_problem_details(basic_info["problemId"])
     if not problem:
         log.warning("Webhook verisi kullaniliyor: %s", display_id)
-        # Details metninden servis adini cikarmaya calis
-        fallback_name = problem_title
-        for part in clean_placeholders(details_text).split("|"):
-            part = part.strip()
-            if "Root Cause" in part:
-                val = part.split(":", 1)[-1].strip()
-                if (
-                    val
-                    and len(val) > 2
-                    and "on Web service" not in val
-                    and "{" not in val
-                ):
-                    fallback_name = val
-                    break
+        # Details metninden veya hint'ten servis adini al
+        fallback_name = service_name_hint or problem_title
+        if not service_name_hint:
+            for part in clean_placeholders(details_text).split("|"):
+                part = part.strip()
+                if "Root Cause" in part:
+                    val = part.split(":", 1)[-1].strip()
+                    if (
+                        val
+                        and len(val) > 2
+                        and "on Web service" not in val
+                        and "{" not in val
+                    ):
+                        fallback_name = val
+                        break
+        # entity_id_hint varsa affectedEntities'e ekle - metrik lookup icin kritik
+        entity_id_to_use = entity_id_hint or ""
         problem = {
             "displayId": display_id,
             "title": problem_title,
@@ -762,19 +780,34 @@ def process_problem(display_id, problem_title, state, dt_url, details_text):
             "severityLevel": "ERROR",
             "impactLevel": "SERVICES",
             "affectedEntities": [
-                {"name": fallback_name, "entityId": {"id": "", "type": "SERVICE"}}
+                {
+                    "name": fallback_name,
+                    "entityId": {"id": entity_id_to_use, "type": "SERVICE"},
+                }
             ],
             "rootCauseEntity": None,
+            # start_ts olmadigi zaman son 1 saati kullan
+            "startTime": int(datetime.now(timezone.utc).timestamp() * 1000) - 3600000,
         }
+        log.info("Fallback: name=%s entity_id=%s", fallback_name, entity_id_to_use)
 
     rc_name = get_root_cause_name(problem, details_text)
     start_ts = problem.get("startTime", 0)
     logs_data = get_recent_logs(start_ts) if start_ts else []
 
-    # Metrik verisi - problem nesnesini de gecir (entity ID icin)
+    # Metrik verisi - entity_id_hint dogrudan problem nesnesinden okunur
+    # entity_id_hint varsa problem.affectedEntities[0].entityId.id guncellensin
+    if entity_id_hint and problem.get("affectedEntities"):
+        problem["affectedEntities"][0]["entityId"]["id"] = entity_id_hint
+
     metrics = {}
-    if rc_name and start_ts:
-        log.info("Metrik sorgusu: %s -> %s", display_id, rc_name)
+    if rc_name:
+        log.info(
+            "Metrik sorgusu: %s -> %s (entity_hint=%s)",
+            display_id,
+            rc_name,
+            entity_id_hint,
+        )
         metrics = get_service_metrics(rc_name, start_ts, problem)
         log.info("Metrik: %s -> %s", display_id, metrics.get("summary", "alinamadi"))
 
@@ -811,12 +844,23 @@ def dynatrace_webhook():
     state = data.get("State", "")
     dt_url = data.get("URL", "")
     details_text = data.get("Details", "")
+    # Opsiyonel: curl/test ile dogrudan entity ID ve servis adi gonderilebilir
+    entity_id_hint = data.get("EntityID", "")  # "SERVICE-5C7E3835D7CD4AAD"
+    service_name_hint = data.get("ServiceName", "")  # "vcollect.viennalife.com.tr:443"
     if state not in ("OPEN", "RESOLVED"):
         log.info("Atlandi: %s state=%s", display_id, state)
         return jsonify({"status": "skipped", "reason": "unknown state"}), 200
     if not display_id:
         return jsonify({"error": "ProblemID eksik"}), 400
-    ok = process_problem(display_id, problem_title, state, dt_url, details_text)
+    ok = process_problem(
+        display_id,
+        problem_title,
+        state,
+        dt_url,
+        details_text,
+        entity_id_hint=entity_id_hint,
+        service_name_hint=service_name_hint,
+    )
     return jsonify(
         {"status": "ok" if ok else "teams_error", "problem": display_id, "state": state}
     ), (200 if ok else 500)
