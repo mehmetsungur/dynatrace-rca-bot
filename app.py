@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Dynatrace -> Claude API -> Microsoft Teams | RCA Bot v1.2"""
+"""Dynatrace -> Claude API -> Microsoft Teams | RCA Bot v1.3
+Yenilikler:
+  - 4xx / 5xx hata orani metrikleri (get_service_metrics)
+  - Yanit suresi metrigi (latency peak/avg)
+  - Etkilenen servis entity ID otomatik cozumleme
+  - Claude prompt metrik verisiyle zenginlestirildi
+  - Teams karta "Show Metrics" butonu eklendi (4xx/5xx/latency + trace bulgusu)
+  - OPEN/RESOLVED renk mantigi webhook_state ile duzeltildi
+"""
 import os, re, json, logging, requests
 from flask import Flask, request, jsonify
 from datetime import datetime, timezone
@@ -80,23 +88,18 @@ def get_recent_logs(start_ts):
 
 
 def clean_placeholders(text):
-    """Cozumlenmemis Dynatrace placeholder {XYZ} degerlerini temizle"""
     return re.sub(r"\{[A-Za-z][A-Za-z0-9]*\}", "", str(text or ""))
 
 
 def get_root_cause_name(problem, details_text):
-    """Gercek root cause servis adini belirle: DT API > affected > details text"""
-    # 1. Dynatrace API rootCauseEntity
     rc = (problem.get("rootCauseEntity") or {}).get("name", "")
     if rc:
         return rc
-    # 2. Affected entities listesinin ilk elemani
     affected = problem.get("affectedEntities", [])
     if affected:
         name = affected[0].get("name", "")
         if name:
             return name
-    # 3. Details metnindeki "Root Cause: XXX" kismindan parse et
     clean = clean_placeholders(details_text)
     for part in clean.split("|"):
         if "Root Cause" in part:
@@ -107,14 +110,135 @@ def get_root_cause_name(problem, details_text):
                 and val.lower() not in ("n/a", "none", "unknown", "")
             ):
                 return val
-    # 4. Problem basligi
     title = problem.get("title", "")
     if title:
         return title
     return "Unknown Service"
 
 
-def ask_claude(problem, details_text, logs, rc_name):
+# ── YENİ: METRİK FONKSİYONLARI ─────────────────────────────────────────────
+
+
+def resolve_service_entity_id(service_name):
+    """Servis adi ile Dynatrace entity ID sini bul"""
+    try:
+        r = requests.get(
+            DT_BASE_URL + "/api/v2/entities",
+            headers=dt_headers(),
+            params={
+                "entitySelector": 'type(SERVICE),entityName.equals("%s")'
+                % service_name,
+                "fields": "entityId",
+                "pageSize": 5,
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        items = r.json().get("entities", [])
+        if items:
+            return items[0]["entityId"]["id"]
+    except Exception as e:
+        log.warning("Entity ID cozumlenemedi (%s): %s", service_name, e)
+    return None
+
+
+def _query_metric(entity_id, metric_selector, from_ts, to_ts, resolution="5m"):
+    """Tek bir metrik sorgular, deger listesi doner"""
+    try:
+        r = requests.get(
+            DT_BASE_URL + "/api/v2/metrics/query",
+            headers=dt_headers(),
+            params={
+                "metricSelector": metric_selector,
+                "entitySelector": 'entityId("%s")' % entity_id,
+                "from": from_ts,
+                "to": to_ts,
+                "resolution": resolution,
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        result = r.json().get("result", [])
+        if result:
+            data = result[0].get("data", [])
+            if data:
+                return data[0].get("values", [])
+    except Exception as e:
+        log.warning("Metrik sorgusu basarisiz (%s): %s", metric_selector, e)
+    return []
+
+
+def get_service_metrics(service_name, start_ts):
+    """
+    Verilen servis icin 4xx, 5xx ve latency metriklerini ceker.
+    Donus: {"fivexx_peak", "fivexx_avg", "fourxx_peak", "fourxx_avg",
+            "latency_peak", "latency_avg", "summary", "entity_id"}
+    """
+    if not start_ts:
+        return {}
+    entity_id = resolve_service_entity_id(service_name)
+    if not entity_id:
+        return {}
+
+    from_ts = datetime.fromtimestamp(start_ts / 1000 - 1800, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    to_ts = datetime.fromtimestamp(start_ts / 1000 + 3600, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+    fivexx = _query_metric(
+        entity_id, "builtin:service.errors.fivexx.rate", from_ts, to_ts
+    )
+    fourxx = _query_metric(
+        entity_id, "builtin:service.errors.fourxx.rate", from_ts, to_ts
+    )
+    latency = _query_metric(entity_id, "builtin:service.response.time", from_ts, to_ts)
+
+    def clean(lst):
+        return [v for v in lst if v is not None]
+
+    def peak(lst):
+        return round(max(lst), 2) if lst else 0
+
+    def avg(lst):
+        return round(sum(lst) / len(lst), 2) if lst else 0
+
+    fivexx_c = clean(fivexx)
+    fourxx_c = clean(fourxx)
+    latency_c = clean(latency)
+
+    fivexx_peak = peak(fivexx_c)
+    fourxx_peak = peak(fourxx_c)
+    fivexx_avg = avg(fivexx_c)
+    fourxx_avg = avg(fourxx_c)
+    latency_avg = round(avg(latency_c) / 1000, 1) if latency_c else 0  # us->ms
+    latency_peak = round(peak(latency_c) / 1000, 1) if latency_c else 0
+
+    parts = []
+    if fivexx_peak > 0:
+        parts.append("5xx: zirve %s%% / ort %s%%" % (fivexx_peak, fivexx_avg))
+    if fourxx_peak > 0:
+        parts.append("4xx: zirve %s%% / ort %s%%" % (fourxx_peak, fourxx_avg))
+    if latency_peak > 0:
+        parts.append("Latency: zirve %sms / ort %sms" % (latency_peak, latency_avg))
+
+    return {
+        "entity_id": entity_id,
+        "fivexx_peak": fivexx_peak,
+        "fivexx_avg": fivexx_avg,
+        "fourxx_peak": fourxx_peak,
+        "fourxx_avg": fourxx_avg,
+        "latency_peak": latency_peak,
+        "latency_avg": latency_avg,
+        "summary": " | ".join(parts) if parts else "Hata ve gecikme tespit edilmedi.",
+    }
+
+
+# ── CLAUDE PROMPT (metrik dahil) ─────────────────────────────────────────────
+
+
+def ask_claude(problem, details_text, logs, rc_name, metrics=None):
     evidences = problem.get("evidenceDetails", {}).get("details", [])
     ev_lines = []
     for ev in evidences[:5]:
@@ -124,6 +248,7 @@ def ask_claude(problem, details_text, logs, rc_name):
             "- [%s] %s: %s"
             % (ev.get("evidenceType", ""), ev.get("entity", {}).get("name", ""), desc)
         )
+
     impacts = problem.get("impactAnalysis", {}).get("impacts", [])
     total_calls = sum(
         i.get("numberOfPotentiallyAffectedServiceCalls", 0) for i in impacts
@@ -133,13 +258,36 @@ def ask_claude(problem, details_text, logs, rc_name):
     namespace = (ns[0] if isinstance(ns, list) and ns else ns) or "N/A"
     log_section = "\n".join(logs[:5]) if logs else "No logs."
     clean_details = clean_placeholders(details_text)[:600]
+
+    metrics_section = "No metric data available."
+    if metrics and metrics.get("summary"):
+        m = metrics
+        metrics_section = (
+            "Service: %s | EntityID: %s\n"
+            "5xx Error Rate: peak=%s%% avg=%s%%\n"
+            "4xx Error Rate: peak=%s%% avg=%s%%\n"
+            "Response Time:  peak=%sms avg=%sms"
+        ) % (
+            rc_name,
+            m.get("entity_id", "N/A"),
+            m.get("fivexx_peak", 0),
+            m.get("fivexx_avg", 0),
+            m.get("fourxx_peak", 0),
+            m.get("fourxx_avg", 0),
+            m.get("latency_peak", 0),
+            m.get("latency_avg", 0),
+        )
+
     prompt = (
         "You are an experienced SRE. Analyze this Dynatrace problem and produce ITIL v4 RCA.\n\n"
         "PROBLEM: %s | %s | Severity: %s | Status: %s\n"
         "Root Cause Service: %s | Affected: %s | Namespace: %s | Calls: %s\n\n"
-        "EVIDENCE:\n%s\n\nLOGS:\n%s\n\nDETAILS:\n%s\n\n"
-        "Respond ONLY with this JSON (no extra text). Write ALL text values in Turkish:\n"
-        '{"root_cause":"2-3 sentence technical root cause",'
+        "EVIDENCE:\n%s\n\n"
+        "LOGS:\n%s\n\n"
+        "HTTP ERROR & LATENCY METRICS (distributed tracing data):\n%s\n\n"
+        "DETAILS:\n%s\n\n"
+        "Respond ONLY with this JSON. Write ALL text values in Turkish:\n"
+        '{"root_cause":"2-3 cumle teknik kok neden",'
         '"confidence":"HIGH or MEDIUM or LOW",'
         '"hypotheses":["H1","H2","H3"],'
         '"contributing_factors":["F1","F2"],'
@@ -147,7 +295,8 @@ def ask_claude(problem, details_text, logs, rc_name):
         '"preventive_actions":["P1","P2"],'
         '"severity_assessment":"Critical or High or Medium or Low",'
         '"repeat_risk":"High or Medium or Low",'
-        '"itil_category":"Infrastructure Failure or Application Error or Performance Degradation or Security"}'
+        '"itil_category":"Infrastructure Failure or Application Error or Performance Degradation or Security",'
+        '"trace_finding":"4xx/5xx ve latency metriklerinden en onemli bulgu (1 cumle)"}'
     ) % (
         problem.get("displayId", "N/A"),
         problem.get("title", "N/A"),
@@ -159,8 +308,10 @@ def ask_claude(problem, details_text, logs, rc_name):
         str(total_calls),
         "\n".join(ev_lines) if ev_lines else "No evidence.",
         log_section,
+        metrics_section,
         clean_details,
     )
+
     response = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -170,7 +321,7 @@ def ask_claude(problem, details_text, logs, rc_name):
         },
         json={
             "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 1500,
+            "max_tokens": 1800,
             "messages": [{"role": "user", "content": prompt}],
         },
         timeout=60,
@@ -184,20 +335,29 @@ def ask_claude(problem, details_text, logs, rc_name):
     return json.loads(raw)
 
 
-def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
+# ── TEAMS ADAPTIVE CARD (Show Metrics butonu eklendi) ────────────────────────
+
+
+def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN", metrics=None):
     display_id = problem.get("displayId", "N/A")
     title = problem.get("title", "Unknown")
     status = problem.get("status", "OPEN")
     severity = problem.get("severityLevel", "")
+    ns = problem.get("k8s.namespace.name")
+    namespace = (ns[0] if isinstance(ns, list) and ns else ns) or ""
+
     is_resolved = (status == "CLOSED") or (webhook_state == "RESOLVED")
     state_label = "CLOSED" if is_resolved else "OPEN"
     state_color = "good" if is_resolved else "attention"
     state_icon = "OK" if is_resolved else "!!"
-    root_cause = rca.get("root_cause", "Analysis incomplete.")
+
+    root_cause = rca.get("root_cause", "Analiz tamamlanamadi.")
     confidence = rca.get("confidence", "MEDIUM")
     severity_ass = rca.get("severity_assessment", "")
     repeat_risk = rca.get("repeat_risk", "")
     itil_cat = rca.get("itil_category", "")
+    trace_finding = rca.get("trace_finding", "")
+
     hyp_text = "\n".join(
         "%d. %s" % (i + 1, h) for i, h in enumerate(rca.get("hypotheses", []))
     )
@@ -208,6 +368,102 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
         "%d. %s" % (i + 1, a) for i, a in enumerate(rca.get("preventive_actions", []))
     )
     con_text = "\n".join("- %s" % c for c in rca.get("contributing_factors", []))
+
+    m = metrics or {}
+    m_5xx_peak = ("%s%%" % m["fivexx_peak"]) if m.get("fivexx_peak") else "-"
+    m_5xx_avg = ("%s%%" % m["fivexx_avg"]) if m.get("fivexx_avg") else "-"
+    m_4xx_peak = ("%s%%" % m["fourxx_peak"]) if m.get("fourxx_peak") else "-"
+    m_4xx_avg = ("%s%%" % m["fourxx_avg"]) if m.get("fourxx_avg") else "-"
+    m_lat_peak = ("%s ms" % m["latency_peak"]) if m.get("latency_peak") else "-"
+    m_lat_avg = ("%s ms" % m["latency_avg"]) if m.get("latency_avg") else "-"
+    m_summary = m.get("summary", "Metrik verisi alinamadi.")
+
+    main_facts = [
+        {"title": "State", "value": state_label},
+        {"title": "Problem ID", "value": display_id},
+        {"title": "Severity", "value": severity},
+        {"title": "Root Cause", "value": rc_name},
+    ]
+    if namespace:
+        main_facts.append({"title": "Namespace", "value": namespace})
+
+    # Show Metrics kart icerigi
+    metrics_card_body = [
+        {
+            "type": "TextBlock",
+            "text": "Distributed Tracing & HTTP Metrikler",
+            "weight": "Bolder",
+            "size": "Medium",
+            "color": "Accent",
+            "spacing": "None",
+        },
+        {
+            "type": "TextBlock",
+            "text": rc_name,
+            "size": "Small",
+            "isSubtle": True,
+            "spacing": "None",
+        },
+        {
+            "type": "TextBlock",
+            "text": "Trace Bulgusu",
+            "weight": "Bolder",
+            "size": "Small",
+            "spacing": "Medium",
+        },
+        {
+            "type": "TextBlock",
+            "text": trace_finding if trace_finding else m_summary,
+            "wrap": True,
+            "size": "Small",
+        },
+        {
+            "type": "TextBlock",
+            "text": "HTTP Hata Oranlari",
+            "weight": "Bolder",
+            "size": "Small",
+            "color": "Attention",
+            "spacing": "Medium",
+        },
+        {
+            "type": "FactSet",
+            "facts": [
+                {"title": "5xx Zirve", "value": m_5xx_peak},
+                {"title": "5xx Ortalama", "value": m_5xx_avg},
+                {"title": "4xx Zirve", "value": m_4xx_peak},
+                {"title": "4xx Ortalama", "value": m_4xx_avg},
+            ],
+        },
+        {
+            "type": "TextBlock",
+            "text": "Yanit Suresi (Latency)",
+            "weight": "Bolder",
+            "size": "Small",
+            "color": "Warning",
+            "spacing": "Medium",
+        },
+        {
+            "type": "FactSet",
+            "facts": [
+                {"title": "Zirve Gecikme", "value": m_lat_peak},
+                {"title": "Ortalama Gecikme", "value": m_lat_avg},
+            ],
+        },
+        {
+            "type": "ActionSet",
+            "actions": [
+                {
+                    "type": "Action.OpenUrl",
+                    "title": "Distributed Traces Ac",
+                    "url": (dt_url or "").replace(
+                        "problemdetails", "distributed-tracing"
+                    )
+                    or dt_url,
+                }
+            ],
+        },
+    ]
+
     return {
         "type": "message",
         "attachments": [
@@ -256,16 +512,7 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
                                 },
                             ],
                         },
-                        {
-                            "type": "FactSet",
-                            "spacing": "Medium",
-                            "facts": [
-                                {"title": "State", "value": state_label},
-                                {"title": "Problem ID", "value": display_id},
-                                {"title": "Severity", "value": severity},
-                                {"title": "Root Cause", "value": rc_name},
-                            ],
-                        },
+                        {"type": "FactSet", "spacing": "Medium", "facts": main_facts},
                         {
                             "type": "ActionSet",
                             "actions": [
@@ -337,7 +584,7 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
                                             },
                                             {
                                                 "type": "TextBlock",
-                                                "text": "Hypotheses",
+                                                "text": "Hipotezler",
                                                 "weight": "Bolder",
                                                 "size": "Small",
                                                 "spacing": "Medium",
@@ -350,7 +597,7 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
                                             },
                                             {
                                                 "type": "TextBlock",
-                                                "text": "Contributing Factors",
+                                                "text": "Katkida Bulunan Faktorler",
                                                 "weight": "Bolder",
                                                 "size": "Small",
                                                 "spacing": "Medium",
@@ -363,7 +610,7 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
                                             },
                                             {
                                                 "type": "TextBlock",
-                                                "text": "Immediate Actions",
+                                                "text": "Acil Aksiyonlar",
                                                 "weight": "Bolder",
                                                 "size": "Small",
                                                 "color": "Attention",
@@ -377,7 +624,7 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
                                             },
                                             {
                                                 "type": "TextBlock",
-                                                "text": "Preventive Actions",
+                                                "text": "Onleyici Aksiyonlar",
                                                 "weight": "Bolder",
                                                 "size": "Small",
                                                 "spacing": "Medium",
@@ -391,6 +638,15 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
                                         ],
                                     },
                                 },
+                                # ── YENİ BUTON ──────────────────────────────────────────
+                                {
+                                    "type": "Action.ShowCard",
+                                    "title": "Show Metrics",
+                                    "card": {
+                                        "type": "AdaptiveCard",
+                                        "body": metrics_card_body,
+                                    },
+                                },
                             ],
                         },
                     ],
@@ -398,6 +654,9 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
             }
         ],
     }
+
+
+# ── ORKESTRATÖR ──────────────────────────────────────────────────────────────
 
 
 def process_problem(display_id, problem_title, state, dt_url, details_text):
@@ -417,13 +676,28 @@ def process_problem(display_id, problem_title, state, dt_url, details_text):
             "affectedEntities": [],
             "rootCauseEntity": None,
         }
+
     rc_name = get_root_cause_name(problem, details_text)
     start_ts = problem.get("startTime", 0)
     logs_data = get_recent_logs(start_ts) if start_ts else []
+
+    # YENİ: metrik verisi çek
+    metrics = {}
+    if rc_name and rc_name not in ("Unknown Service",) and start_ts:
+        log.info("Metrik sorgusu basladi: %s -> %s", display_id, rc_name)
+        metrics = get_service_metrics(rc_name, start_ts)
+        log.info("Metrik: %s -> %s", display_id, metrics.get("summary", "alinamadi"))
+
     log.info("Claude sorgu: %s (rc: %s)", display_id, rc_name)
-    rca = ask_claude(problem, details_text, logs_data, rc_name)
-    log.info("RCA OK: %s confidence=%s", display_id, rca.get("confidence"))
-    card = build_teams_card(problem, rca, dt_url, rc_name, state)
+    rca = ask_claude(problem, details_text, logs_data, rc_name, metrics)
+    log.info(
+        "RCA OK: %s confidence=%s trace_finding=%s",
+        display_id,
+        rca.get("confidence"),
+        bool(rca.get("trace_finding")),
+    )
+
+    card = build_teams_card(problem, rca, dt_url, rc_name, state, metrics)
     r = requests.post(
         TEAMS_WEBHOOK,
         headers={"Content-Type": "application/json"},
@@ -435,6 +709,9 @@ def process_problem(display_id, problem_title, state, dt_url, details_text):
         return True
     log.error("Teams hata: %s %s", r.status_code, r.text[:200])
     return False
+
+
+# ── FLASK ENDPOINTLERİ ───────────────────────────────────────────────────────
 
 
 @app.route("/webhook/dynatrace-rca", methods=["POST"])
@@ -449,7 +726,6 @@ def dynatrace_webhook():
     state = data.get("State", "")
     dt_url = data.get("URL", "")
     details_text = data.get("Details", "")
-    # OPEN ve RESOLVED her ikisi de isleniyor
     if state not in ("OPEN", "RESOLVED"):
         log.info("Atlandi: %s state=%s", display_id, state)
         return jsonify({"status": "skipped", "reason": "unknown state"}), 200
@@ -470,12 +746,12 @@ def health():
     ]
     if missing:
         return jsonify({"status": "degraded", "missing_env": missing}), 200
-    return jsonify({"status": "ok", "version": "1.2.0"}), 200
+    return jsonify({"status": "ok", "version": "1.3.0"}), 200
 
 
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({"service": "Dynatrace RCA Bot", "version": "1.2.0"}), 200
+    return jsonify({"service": "Dynatrace RCA Bot", "version": "1.3.0"}), 200
 
 
 if __name__ == "__main__":
