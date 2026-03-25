@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Dynatrace -> Claude API -> Microsoft Teams | RCA Bot v1.4
-- Metrik API cagrisi kaldirildi (Railway ic aga erisemiyor)
-- Claude analizi: evidence + log + problem detayi uzerinden yapilir
-- Teams kart: Show RCA Analysis (hipotez, aksiyon, ITIL) - temiz ve net
+"""Dynatrace -> Claude API -> Microsoft Teams | RCA Bot v1.5
+- Detayli RCA: baseline sayilari, downstream etki, timeline, pattern analizi
+- Claude JSON sema genisletildi: 12 alan
+- Teams kart: zengin Show RCA Analysis (baseline tablo + downstream + pattern)
 - OPEN kirmizi !! / RESOLVED yesil OK
 """
 import os, re, json, logging, requests
@@ -71,11 +71,11 @@ def get_recent_logs(start_ts):
         r = requests.get(
             DT_BASE_URL + "/api/v2/logs/search",
             headers=dt_headers(),
-            params={"from": from_t, "to": to_t, "query": "error", "limit": 8},
+            params={"from": from_t, "to": to_t, "query": "error", "limit": 10},
             timeout=15,
         )
         return [
-            i.get("content", "")[:200]
+            i.get("content", "")[:250]
             for i in r.json().get("results", [])
             if i.get("content")
         ]
@@ -89,10 +89,6 @@ def clean_placeholders(text):
 
 
 def get_root_cause_name(problem, details_text):
-    """
-    Kisa, temiz servis adini dondur (entity lookup ve kart icin).
-    Oncelik: rootCauseEntity > affectedEntities[0] > details parse > title parse
-    """
     rc = (problem.get("rootCauseEntity") or {}).get("name", "")
     if rc:
         return rc
@@ -126,80 +122,317 @@ def get_root_cause_name(problem, details_text):
     return "Unknown Service"
 
 
-# ── CLAUDE PROMPT ─────────────────────────────────────────────────────────────
+def _format_ms(us_val):
+    """Mikrosaniyeyi okunabilir formata cevir"""
+    try:
+        ms = float(us_val) / 1000.0
+        if ms >= 1000:
+            return "%.2f sn" % (ms / 1000.0)
+        return "%.0f ms" % ms
+    except Exception:
+        return str(us_val)
 
 
-def ask_claude(problem, details_text, logs, rc_name):
+def _pct(val):
+    """Float orani yuzde stringe cevir"""
+    try:
+        return "%.4f%%" % (float(val) * 100)
+    except Exception:
+        return str(val)
+
+
+def extract_evidence_data(problem):
+    """
+    Dynatrace evidence'indan yapılandırılmış veri çıkar:
+    - Baseline karşılaştırmaları (error rate, response time, throughput)
+    - Downstream etki
+    - Timestamp bilgileri
+    - Event tipleri
+    """
     evidences = problem.get("evidenceDetails", {}).get("details", [])
+    impacts = problem.get("impactAnalysis", {}).get("impacts", [])
+    start_ts = problem.get("startTime", 0)
+    end_ts = problem.get("endTime", -1)
+
+    # Zaman bilgisi
+    start_str = ""
+    end_str = ""
+    duration_str = ""
+    if start_ts:
+        start_dt = datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc)
+        start_str = start_dt.strftime("%H:%M UTC")
+        if end_ts and end_ts > 0:
+            end_dt = datetime.fromtimestamp(end_ts / 1000, tz=timezone.utc)
+            end_str = end_dt.strftime("%H:%M UTC")
+            dur_min = int((end_ts - start_ts) / 60000)
+            duration_str = "%d dakika" % dur_min
+
+    # Evidence satırlari (Claude icin zengin metin)
     ev_lines = []
-    for ev in evidences[:5]:
+    # Evidence ozeti (kart icin)
+    ev_card_lines = []
+    baseline_facts = []
+
+    for ev in evidences:
+        ev_type = ev.get("evidenceType", "")
+        ev_name = ev.get("displayName", "")
+        ent_name = ev.get("entity", {}).get("name", "")
         props = {p["key"]: p["value"] for p in ev.get("data", {}).get("properties", [])}
-        # Error rate / response time baseline bilgilerini de ekle
-        ev_desc = props.get("dt.event.description", "")[:200]
-        ev_lines.append(
-            "- [%s] %s: %s"
-            % (
-                ev.get("evidenceType", ""),
-                ev.get("entity", {}).get("name", ""),
-                ev_desc,
-            )
+        desc = props.get("dt.event.description", "")[:300]
+        rc_rel = ev.get("rootCauseRelevant", False)
+        unit = ev.get("unit", "")
+
+        # TRANSACTIONAL evidence - daha fazla sayisal veri var
+        before_val = ev.get("valueBeforeChangePoint")
+        after_val = ev.get("valueAfterChangePoint")
+
+        line = "- [%s][%s] %s: %s" % (
+            ev_type,
+            "ROOT_CAUSE" if rc_rel else "CONTEXT",
+            ent_name,
+            desc,
         )
-        # Sayisal evidence varsa ekle (error rate, throughput vs)
-        before = props.get("dt.event.baseline.error_rate_reference", "")
-        after = props.get("dt.event.baseline.error_rate", "")
-        if before and after:
-            try:
-                ev_lines.append(
-                    "  baseline: %.4f%% -> simdiki: %.4f%% (%.1fx artis)"
-                    % (
-                        float(before) * 100,
-                        float(after) * 100,
-                        float(after) / float(before) if float(before) > 0 else 0,
+        ev_lines.append(line)
+
+        if before_val is not None and after_val is not None:
+            if "MicroSecond" in unit or "response" in ev_name.lower():
+                b_fmt = _format_ms(before_val)
+                a_fmt = _format_ms(after_val)
+                try:
+                    ratio = (
+                        float(after_val) / float(before_val)
+                        if float(before_val) > 0
+                        else 0
                     )
+                    change = (
+                        "%.0f%% artis" % ((ratio - 1) * 100)
+                        if ratio > 1
+                        else "%.0f%% azalis" % ((1 - ratio) * 100)
+                    )
+                except Exception:
+                    change = ""
+                ev_lines.append("  %s: %s → %s (%s)" % (ev_name, b_fmt, a_fmt, change))
+                ev_card_lines.append(
+                    "%s: %s → %s (%s)" % (ev_name, b_fmt, a_fmt, change)
+                )
+                baseline_facts.append(
+                    {"title": ev_name, "value": "%s → %s (%s)" % (b_fmt, a_fmt, change)}
+                )
+            elif "PerMinute" in unit or "throughput" in ev_name.lower():
+                ev_lines.append(
+                    "  %s throughput: %.1f/dk → %.1f/dk"
+                    % (ev_name, float(before_val), float(after_val))
+                )
+                ev_card_lines.append(
+                    "%s: %.1f/dk → %.1f/dk"
+                    % (ev_name, float(before_val), float(after_val))
+                )
+                baseline_facts.append(
+                    {
+                        "title": ev_name,
+                        "value": "%.1f → %.1f /dk"
+                        % (float(before_val), float(after_val)),
+                    }
+                )
+
+        # Error rate baseline
+        err_ref = props.get("dt.event.baseline.error_rate_reference", "")
+        err_cur = props.get("dt.event.baseline.error_rate", "")
+        if err_ref and err_cur:
+            try:
+                b_pct = float(err_ref) * 100
+                a_pct = float(err_cur) * 100
+                ratio = a_pct / b_pct if b_pct > 0 else 0
+                ev_lines.append(
+                    "  Hata orani: %.4f%% → %.4f%% (%.1fx artis)"
+                    % (b_pct, a_pct, ratio)
+                )
+                ev_card_lines.append(
+                    "Hata orani: %.4f%% → %.4f%% (%.1fx artis)" % (b_pct, a_pct, ratio)
+                )
+                baseline_facts.append(
+                    {
+                        "title": "Hata Orani",
+                        "value": "%.4f%% → %.4f%% (%.1fx)" % (b_pct, a_pct, ratio),
+                    }
                 )
             except Exception:
                 pass
 
+        # Response time P50/P90 (event bazli)
+        rt_p50 = props.get("dt.event.baseline.response_time_p50", "")
+        rt_p90 = props.get("dt.event.baseline.response_time_p90", "")
+        rt_p50_ref = props.get("dt.event.baseline.response_time_p50_reference", "")
+        rt_p90_ref = props.get("dt.event.baseline.response_time_p90_reference", "")
+        if rt_p90 and rt_p90_ref:
+            try:
+                p90_cur = float(rt_p90)
+                p90_ref = float(rt_p90_ref)
+                chg = ((p90_cur - p90_ref) / p90_ref * 100) if p90_ref > 0 else 0
+                ev_lines.append(
+                    "  P90 yanit suresi: %s → %s (%+.1f%%)"
+                    % (_format_ms(p90_ref), _format_ms(p90_cur), chg)
+                )
+                ev_card_lines.append(
+                    "P90: %s → %s (%+.1f%%)"
+                    % (_format_ms(p90_ref), _format_ms(p90_cur), chg)
+                )
+                baseline_facts.append(
+                    {
+                        "title": "P90 Yanit Suresi",
+                        "value": "%s → %s (%+.1f%%)"
+                        % (_format_ms(p90_ref), _format_ms(p90_cur), chg),
+                    }
+                )
+            except Exception:
+                pass
+        if rt_p50 and rt_p50_ref:
+            try:
+                p50_cur = float(rt_p50)
+                p50_ref = float(rt_p50_ref)
+                chg = ((p50_cur - p50_ref) / p50_ref * 100) if p50_ref > 0 else 0
+                ev_lines.append(
+                    "  P50 yanit suresi: %s → %s (%+.1f%%)"
+                    % (_format_ms(p50_ref), _format_ms(p50_cur), chg)
+                )
+                ev_card_lines.append(
+                    "P50: %s → %s (%+.1f%%)"
+                    % (_format_ms(p50_ref), _format_ms(p50_cur), chg)
+                )
+                baseline_facts.append(
+                    {
+                        "title": "P50 Yanit Suresi",
+                        "value": "%s → %s (%+.1f%%)"
+                        % (_format_ms(p50_ref), _format_ms(p50_cur), chg),
+                    }
+                )
+            except Exception:
+                pass
+
+        # Affected load
+        load = props.get("dt.event.baseline.affected_load", "")
+        total_load = props.get("dt.event.baseline.total_load", "")
+        if load and total_load:
+            ev_lines.append("  Etkilenen yuk: %s / %s istek" % (load, total_load))
+
+    # Downstream etki
+    downstream_lines = []
+    total_downstream = 0
+    for imp in impacts:
+        imp_name = imp.get("impactedEntity", {}).get("name", "")
+        imp_calls = imp.get("numberOfPotentiallyAffectedServiceCalls", 0)
+        total_downstream += imp_calls
+        downstream_lines.append("%s: %d cagri etkilendi" % (imp_name[:60], imp_calls))
+
+    return {
+        "ev_lines": ev_lines,
+        "ev_card_lines": ev_card_lines,
+        "baseline_facts": baseline_facts,
+        "downstream_lines": downstream_lines,
+        "total_downstream": total_downstream,
+        "start_str": start_str,
+        "end_str": end_str,
+        "duration_str": duration_str,
+    }
+
+
+# ── CLAUDE PROMPT ─────────────────────────────────────────────────────────────
+
+
+def ask_claude(problem, details_text, logs, rc_name):
+    ev_data = extract_evidence_data(problem)
+
+    affected = [e["name"] for e in problem.get("affectedEntities", [])]
+    ns = problem.get("k8s.namespace.name")
+    namespace = (ns[0] if isinstance(ns, list) and ns else ns) or "N/A"
+    log_section = (
+        "\n".join(logs[:6]) if logs else "Log alinamadi (ic ag erisim kisitli)."
+    )
+    clean_det = clean_placeholders(details_text)[:800]
     impacts = problem.get("impactAnalysis", {}).get("impacts", [])
     total_calls = sum(
         i.get("numberOfPotentiallyAffectedServiceCalls", 0) for i in impacts
     )
-    affected = [e["name"] for e in problem.get("affectedEntities", [])]
-    ns = problem.get("k8s.namespace.name")
-    namespace = (ns[0] if isinstance(ns, list) and ns else ns) or "N/A"
-    log_section = "\n".join(logs[:5]) if logs else "Log yok."
-    clean_details = clean_placeholders(details_text)[:800]
 
-    prompt = (
-        "Sen deneyimli bir SRE uzmanisın. Asagidaki Dynatrace problemi icin ITIL v4 RCA analizi yap.\n\n"
-        "PROBLEM: %s | %s | Severity: %s | Status: %s\n"
-        "Root Cause Servis: %s | Etkilenen: %s | Namespace: %s | Etkilenen Cagri: %s\n\n"
-        "EVIDENCE (hata orani baseline verileri dahil):\n%s\n\n"
-        "LOG KAYITLARI:\n%s\n\n"
-        "DETAYLAR:\n%s\n\n"
-        "SADECE asagidaki JSON formatinda yanit ver (fazladan metin ekleme). "
-        "Tum metin degerlerini Turkce yaz:\n"
-        '{"root_cause":"2-3 cumle teknik kok neden. Evidence baseline verilerini kullan (ornek: hata orani X%%den Y%%e yukseldi)","'
-        'confidence":"HIGH or MEDIUM or LOW","'
-        'hypotheses":["H1","H2","H3"],"'
-        'contributing_factors":["F1","F2"],"'
-        'immediate_actions":["A1 - kubectl komutu ile","A2","A3"],"'
-        'preventive_actions":["P1","P2"],"'
-        'severity_assessment":"Critical or High or Medium or Low","'
-        'repeat_risk":"High or Medium or Low","'
-        'itil_category":"Infrastructure Failure or Application Error or Performance Degradation or Security"}'
-    ) % (
-        problem.get("displayId", "N/A"),
-        problem.get("title", "N/A"),
-        problem.get("severityLevel", "N/A"),
-        problem.get("status", "N/A"),
-        rc_name,
-        ", ".join(affected[:5]) if affected else "Belirsiz",
-        namespace,
-        str(total_calls),
-        "\n".join(ev_lines) if ev_lines else "Evidence yok.",
-        log_section,
-        clean_details,
+    downstream_block = (
+        "\n".join(ev_data["downstream_lines"])
+        if ev_data["downstream_lines"]
+        else "Downstream etki yok."
+    )
+    evidence_block = (
+        "\n".join(ev_data["ev_lines"]) if ev_data["ev_lines"] else "Evidence alinamadi."
+    )
+
+    prompt = """Sen kıdemli bir SRE ve Site Reliability Engineer'sın. ITIL v4 ve PMI PMBOK standartlarinda Root Cause Analysis uretiyorsun.
+
+PROBLEM OZETI:
+- ID: {display_id} | Baslik: {title}
+- Severity: {severity} | Status: {status}
+- Root Cause Servis: {rc_name}
+- Etkilenen Servisler: {affected}
+- Namespace: {namespace}
+- Baslangic: {start_str} | Bitis: {end_str} | Sure: {duration}
+- Toplam Etkilenen Cagri: {total_calls}
+
+DYNATRACE EVIDENCE (Baseline karsilastirma verileri):
+{evidence_block}
+
+DOWNSTREAM ETKI:
+{downstream_block}
+
+LOG KAYITLARI:
+{log_section}
+
+DETAYLAR:
+{details}
+
+KRITIK TALIMAT: Asagidaki JSON formatinda DETAYLI analiz uret. Turkce yaz. Her alan icin gercek sayisal verileri kullan.
+Evidence'daki baseline sayilarini mutlaka belirt (ornek: "P90 yanit suresi 3.89s'den 9.51s'ye yukseldi, %144 artis").
+Sadece JSON dondur, baska metin ekleme:
+
+{{
+  "root_cause": "3-4 cumle. Gercek baseline sayilarini kullanarak teknik kok nedeni acikla. Evidence'daki P50/P90/hata orani degerlerini yuzde artis ile belirt.",
+  "confidence": "HIGH veya MEDIUM veya LOW",
+  "severity_assessment": "Critical veya High veya Medium veya Low",
+  "repeat_risk": "High veya Medium veya Low",
+  "itil_category": "Infrastructure Failure veya Application Error veya Performance Degradation veya Security",
+  "pattern_analysis": "Tek cumle: P50 mi P90 mu etkilendi, sporadic mi surekli mi, yuk bagimliligi var mi. Bu pattern ne anlama geliyor.",
+  "blast_radius": "Etkilenen servis sayisi, downstream cagri sayisi ve kullanici etkisini belirt.",
+  "hypotheses": [
+    "H1: En yuksek olasilikli hipotez - gercek metrik degerlerle destekle",
+    "H2: Ikinci hipotez",
+    "H3: Ucuncu hipotez"
+  ],
+  "contributing_factors": [
+    "F1: Gercek bir katkida bulunan faktor",
+    "F2: Ikinci faktor"
+  ],
+  "immediate_actions": [
+    "A1: kubectl get pods -n {namespace} --field-selector=status.phase!=Running ile basla",
+    "A2: Ikinci acil aksiyon - spesifik komut veya adimla",
+    "A3: Ucuncu acil aksiyon"
+  ],
+  "preventive_actions": [
+    "P1: Tekrari onleyecek mimari veya konfigurasyon degisikligi",
+    "P2: Izleme ve erken uyari iyilestirmesi"
+  ],
+  "timeline": "Sorunun zaman akisi: ne zaman basladi, ne kadar surdu, ne zaman cozuldu."
+}}""".format(
+        display_id=problem.get("displayId", "N/A"),
+        title=problem.get("title", "N/A"),
+        severity=problem.get("severityLevel", "N/A"),
+        status=problem.get("status", "N/A"),
+        rc_name=rc_name,
+        affected=", ".join(affected[:5]) if affected else "Belirsiz",
+        namespace=namespace,
+        start_str=ev_data["start_str"] or "Bilinmiyor",
+        end_str=ev_data["end_str"] or "Devam ediyor",
+        duration=ev_data["duration_str"] or "Belirsiz",
+        total_calls=str(total_calls),
+        evidence_block=evidence_block,
+        downstream_block=downstream_block,
+        log_section=log_section,
+        details=clean_det,
     )
 
     response = requests.post(
@@ -211,10 +444,10 @@ def ask_claude(problem, details_text, logs, rc_name):
         },
         json={
             "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 1800,
+            "max_tokens": 2500,
             "messages": [{"role": "user", "content": prompt}],
         },
-        timeout=60,
+        timeout=90,
     )
     response.raise_for_status()
     raw = response.json()["content"][0]["text"].strip()
@@ -241,23 +474,35 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
     state_color = "good" if is_resolved else "attention"
     state_icon = "OK" if is_resolved else "!!"
 
+    # RCA alanlari
     root_cause = rca.get("root_cause", "Analiz tamamlanamadi.")
     confidence = rca.get("confidence", "MEDIUM")
     severity_ass = rca.get("severity_assessment", "")
     repeat_risk = rca.get("repeat_risk", "")
     itil_cat = rca.get("itil_category", "")
+    pattern_analysis = rca.get("pattern_analysis", "")
+    blast_radius = rca.get("blast_radius", "")
+    timeline = rca.get("timeline", "")
 
-    hyp_text = "\n".join(
-        "%d. %s" % (i + 1, h) for i, h in enumerate(rca.get("hypotheses", []))
-    )
-    imm_text = "\n".join(
-        "%d. %s" % (i + 1, a) for i, a in enumerate(rca.get("immediate_actions", []))
-    )
-    prev_text = "\n".join(
-        "%d. %s" % (i + 1, a) for i, a in enumerate(rca.get("preventive_actions", []))
-    )
-    con_text = "\n".join("- %s" % c for c in rca.get("contributing_factors", []))
+    hyp_list = rca.get("hypotheses", [])
+    imm_list = rca.get("immediate_actions", [])
+    prev_list = rca.get("preventive_actions", [])
+    con_list = rca.get("contributing_factors", [])
 
+    hyp_text = "\n".join("%d. %s" % (i + 1, h) for i, h in enumerate(hyp_list))
+    imm_text = "\n".join("%d. %s" % (i + 1, a) for i, a in enumerate(imm_list))
+    prev_text = "\n".join("%d. %s" % (i + 1, a) for i, a in enumerate(prev_list))
+    con_text = "\n".join("- %s" % c for c in con_list)
+
+    # Evidence verisi
+    ev_data = extract_evidence_data(problem)
+    baseline_facts = ev_data["baseline_facts"]
+    downstream_lines = ev_data["downstream_lines"]
+    ev_card_text = (
+        "\n".join(ev_data["ev_card_lines"]) if ev_data["ev_card_lines"] else ""
+    )
+
+    # Ana kart fact'leri
     main_facts = [
         {"title": "State", "value": state_label},
         {"title": "Problem ID", "value": display_id},
@@ -266,28 +511,14 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
     ]
     if namespace:
         main_facts.append({"title": "Namespace", "value": namespace})
+    if ev_data["duration_str"]:
+        main_facts.append({"title": "Sure", "value": ev_data["duration_str"]})
 
-    # Evidence verilerini Show Details icin hazirla
-    evidences = problem.get("evidenceDetails", {}).get("details", [])
-    ev_summary_lines = []
-    for ev in evidences[:3]:
-        props = {p["key"]: p["value"] for p in ev.get("data", {}).get("properties", [])}
-        desc = props.get("dt.event.description", "")[:150]
-        before = props.get("dt.event.baseline.error_rate_reference", "")
-        after = props.get("dt.event.baseline.error_rate", "")
-        if desc:
-            ev_summary_lines.append(desc)
-        if before and after:
-            try:
-                ev_summary_lines.append(
-                    "Hata orani: %.3f%% → %.3f%%"
-                    % (float(before) * 100, float(after) * 100)
-                )
-            except Exception:
-                pass
-    evidence_text = "\n".join(ev_summary_lines) if ev_summary_lines else root_cause
+    # ── Show RCA Analysis kart icerigi (detayli) ──
+    rca_body = []
 
-    rca_card_body = [
+    # 1. Baslik + root cause
+    rca_body.append(
         {
             "type": "TextBlock",
             "text": "Root Cause Analysis",
@@ -295,14 +526,20 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
             "size": "Medium",
             "color": "Attention",
             "spacing": "None",
-        },
+        }
+    )
+    rca_body.append(
         {
             "type": "TextBlock",
             "text": root_cause,
             "wrap": True,
             "size": "Small",
             "spacing": "Small",
-        },
+        }
+    )
+
+    # 2. Ozet FactSet
+    rca_body.append(
         {
             "type": "FactSet",
             "spacing": "Small",
@@ -313,23 +550,148 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
                 {"title": "Repeat Risk", "value": repeat_risk},
                 {"title": "ITIL Kategori", "value": itil_cat},
             ],
-        },
+        }
+    )
+
+    # 3. Timeline (varsa)
+    if timeline:
+        rca_body.append(
+            {
+                "type": "TextBlock",
+                "text": "Zaman Akisi",
+                "weight": "Bolder",
+                "size": "Small",
+                "color": "Accent",
+                "spacing": "Medium",
+            }
+        )
+        rca_body.append(
+            {"type": "TextBlock", "text": timeline, "wrap": True, "size": "Small"}
+        )
+
+    # 4. Pattern analizi (varsa)
+    if pattern_analysis:
+        rca_body.append(
+            {
+                "type": "TextBlock",
+                "text": "Hata Paterni",
+                "weight": "Bolder",
+                "size": "Small",
+                "color": "Accent",
+                "spacing": "Medium",
+            }
+        )
+        rca_body.append(
+            {
+                "type": "TextBlock",
+                "text": pattern_analysis,
+                "wrap": True,
+                "size": "Small",
+            }
+        )
+
+    # 5. Blast radius (varsa)
+    if blast_radius:
+        rca_body.append(
+            {
+                "type": "TextBlock",
+                "text": "Etki Alani",
+                "weight": "Bolder",
+                "size": "Small",
+                "spacing": "Medium",
+            }
+        )
+        rca_body.append(
+            {"type": "TextBlock", "text": blast_radius, "wrap": True, "size": "Small"}
+        )
+
+    # 6. Dynatrace Baseline Evidence (gercek sayilar)
+    if baseline_facts:
+        rca_body.append(
+            {
+                "type": "TextBlock",
+                "text": "Dynatrace Baseline Verileri",
+                "weight": "Bolder",
+                "size": "Small",
+                "color": "Accent",
+                "spacing": "Medium",
+            }
+        )
+        rca_body.append({"type": "FactSet", "facts": baseline_facts})
+    elif ev_card_text:
+        rca_body.append(
+            {
+                "type": "TextBlock",
+                "text": "Dynatrace Evidence",
+                "weight": "Bolder",
+                "size": "Small",
+                "color": "Accent",
+                "spacing": "Medium",
+            }
+        )
+        rca_body.append(
+            {
+                "type": "TextBlock",
+                "text": ev_card_text,
+                "wrap": True,
+                "size": "Small",
+                "isSubtle": True,
+            }
+        )
+
+    # 7. Downstream etki
+    if downstream_lines:
+        rca_body.append(
+            {
+                "type": "TextBlock",
+                "text": "Downstream Etki (%d servis cagri)"
+                % ev_data["total_downstream"],
+                "weight": "Bolder",
+                "size": "Small",
+                "spacing": "Medium",
+            }
+        )
+        rca_body.append(
+            {
+                "type": "TextBlock",
+                "text": "\n".join(downstream_lines[:5]),
+                "wrap": True,
+                "size": "Small",
+                "isSubtle": True,
+            }
+        )
+
+    # 8. Hipotezler
+    rca_body.append(
         {
             "type": "TextBlock",
             "text": "Hipotezler",
             "weight": "Bolder",
             "size": "Small",
             "spacing": "Medium",
-        },
-        {"type": "TextBlock", "text": hyp_text, "wrap": True, "size": "Small"},
-        {
-            "type": "TextBlock",
-            "text": "Katkida Bulunan Faktorler",
-            "weight": "Bolder",
-            "size": "Small",
-            "spacing": "Medium",
-        },
-        {"type": "TextBlock", "text": con_text, "wrap": True, "size": "Small"},
+        }
+    )
+    rca_body.append(
+        {"type": "TextBlock", "text": hyp_text, "wrap": True, "size": "Small"}
+    )
+
+    # 9. Katkida bulunan faktorler
+    if con_text:
+        rca_body.append(
+            {
+                "type": "TextBlock",
+                "text": "Katkida Bulunan Faktorler",
+                "weight": "Bolder",
+                "size": "Small",
+                "spacing": "Medium",
+            }
+        )
+        rca_body.append(
+            {"type": "TextBlock", "text": con_text, "wrap": True, "size": "Small"}
+        )
+
+    # 10. Acil aksiyonlar
+    rca_body.append(
         {
             "type": "TextBlock",
             "text": "Acil Aksiyonlar",
@@ -337,33 +699,25 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
             "size": "Small",
             "color": "Attention",
             "spacing": "Medium",
-        },
-        {"type": "TextBlock", "text": imm_text, "wrap": True, "size": "Small"},
+        }
+    )
+    rca_body.append(
+        {"type": "TextBlock", "text": imm_text, "wrap": True, "size": "Small"}
+    )
+
+    # 11. Onleyici aksiyonlar
+    rca_body.append(
         {
             "type": "TextBlock",
             "text": "Onleyici Aksiyonlar",
             "weight": "Bolder",
             "size": "Small",
             "spacing": "Medium",
-        },
-        {"type": "TextBlock", "text": prev_text, "wrap": True, "size": "Small"},
-        # Evidence / baseline verisi
-        {
-            "type": "TextBlock",
-            "text": "Dynatrace Evidence",
-            "weight": "Bolder",
-            "size": "Small",
-            "color": "Accent",
-            "spacing": "Medium",
-        },
-        {
-            "type": "TextBlock",
-            "text": evidence_text,
-            "wrap": True,
-            "size": "Small",
-            "isSubtle": True,
-        },
-    ]
+        }
+    )
+    rca_body.append(
+        {"type": "TextBlock", "text": prev_text, "wrap": True, "size": "Small"}
+    )
 
     return {
         "type": "message",
@@ -398,7 +752,7 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
                                     "items": [
                                         {
                                             "type": "TextBlock",
-                                            "text": "Dynatrace Notification",
+                                            "text": "Dynatrace RCA",
                                             "weight": "bolder",
                                             "size": "large",
                                             "color": state_color,
@@ -439,10 +793,7 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
                                 {
                                     "type": "Action.ShowCard",
                                     "title": "Show RCA Analysis",
-                                    "card": {
-                                        "type": "AdaptiveCard",
-                                        "body": rca_card_body,
-                                    },
+                                    "card": {"type": "AdaptiveCard", "body": rca_body},
                                 },
                             ],
                         },
@@ -459,7 +810,6 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
 def process_problem(display_id, problem_title, state, dt_url, details_text):
     log.info("Isleniyor: %s - %s (%s)", display_id, problem_title, state)
 
-    # 1. Problem detayini DT API'den cekmeye calis (ic ag erisimi yoksa fallback)
     basic_info = find_problem_by_display_id(display_id)
     problem = {}
     if basic_info.get("problemId"):
@@ -467,7 +817,6 @@ def process_problem(display_id, problem_title, state, dt_url, details_text):
 
     if not problem:
         log.warning("Webhook verisi kullaniliyor: %s", display_id)
-        # Details metninden servis adini parse et
         fallback_name = problem_title
         for part in clean_placeholders(details_text).split("|"):
             part = part.strip()
@@ -494,19 +843,19 @@ def process_problem(display_id, problem_title, state, dt_url, details_text):
             "startTime": int(datetime.now(timezone.utc).timestamp() * 1000) - 3600000,
         }
 
-    # 2. Root cause servis adini belirle
     rc_name = get_root_cause_name(problem, details_text)
     start_ts = problem.get("startTime", 0)
-
-    # 3. Log verisi (ic ag yoksa bos donecek - normal)
     logs_data = get_recent_logs(start_ts) if start_ts else []
 
-    # 4. Claude ile RCA uret (evidence + log yeterli, metrik API yok)
     log.info("Claude sorgu: %s (rc: %s)", display_id, rc_name)
     rca = ask_claude(problem, details_text, logs_data, rc_name)
-    log.info("RCA OK: %s confidence=%s", display_id, rca.get("confidence"))
+    log.info(
+        "RCA OK: %s confidence=%s pattern=%s",
+        display_id,
+        rca.get("confidence"),
+        bool(rca.get("pattern_analysis")),
+    )
 
-    # 5. Teams'e gonder
     card = build_teams_card(problem, rca, dt_url, rc_name, state)
     r = requests.post(
         TEAMS_WEBHOOK,
@@ -556,12 +905,12 @@ def health():
     ]
     if missing:
         return jsonify({"status": "degraded", "missing_env": missing}), 200
-    return jsonify({"status": "ok", "version": "1.4.0"}), 200
+    return jsonify({"status": "ok", "version": "1.5.0"}), 200
 
 
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({"service": "Dynatrace RCA Bot", "version": "1.4.0"}), 200
+    return jsonify({"service": "Dynatrace RCA Bot", "version": "1.5.0"}), 200
 
 
 if __name__ == "__main__":
