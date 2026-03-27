@@ -478,76 +478,68 @@ def ask_claude(problem, details_text, logs, rc_name):
         "\n".join(ev_data["ev_lines"]) if ev_data["ev_lines"] else "Evidence alinamadi."
     )
 
-    prompt = """Sen kıdemli bir SRE ve Site Reliability Engineer'sın. ITIL v4 ve PMI PMBOK standartlarinda Root Cause Analysis uretiyorsun.
-
-PROBLEM OZETI:
-- ID: {display_id} | Baslik: {title}
-- Severity: {severity} | Status: {status}
-- Root Cause Servis: {rc_name}
-- Etkilenen Servisler: {affected}
-- Namespace: {namespace}
-- Baslangic: {start_str} | Bitis: {end_str} | Sure: {duration}
-- Toplam Etkilenen Cagri: {total_calls}
-
-DYNATRACE EVIDENCE (Baseline karsilastirma verileri):
-{evidence_block}
-
-DOWNSTREAM ETKI:
-{downstream_block}
-
-LOG KAYITLARI:
-{log_section}
-
-DETAYLAR:
-{details}
-
-KRITIK TALIMAT: Asagidaki JSON formatinda DETAYLI analiz uret. Turkce yaz. Her alan icin gercek sayisal verileri kullan.
-Evidence'daki baseline sayilarini mutlaka belirt (ornek: "P90 yanit suresi 3.89s'den 9.51s'ye yukseldi, %144 artis").
-Sadece JSON dondur, baska metin ekleme:
-
-{{
-  "root_cause": "3-4 cumle. Gercek baseline sayilarini kullanarak teknik kok nedeni acikla. Evidence'daki P50/P90/hata orani degerlerini yuzde artis ile belirt.",
-  "confidence": "HIGH veya MEDIUM veya LOW",
-  "severity_assessment": "Critical veya High veya Medium veya Low",
-  "repeat_risk": "High veya Medium veya Low",
-  "itil_category": "Infrastructure Failure veya Application Error veya Performance Degradation veya Security",
-  "pattern_analysis": "Tek cumle: P50 mi P90 mu etkilendi, sporadic mi surekli mi, yuk bagimliligi var mi. Bu pattern ne anlama geliyor.",
-  "blast_radius": "Etkilenen servis sayisi, downstream cagri sayisi ve kullanici etkisini belirt.",
-  "hypotheses": [
-    "H1: En yuksek olasilikli hipotez - gercek metrik degerlerle destekle",
-    "H2: Ikinci hipotez",
-    "H3: Ucuncu hipotez"
-  ],
-  "contributing_factors": [
-    "F1: Gercek bir katkida bulunan faktor",
-    "F2: Ikinci faktor"
-  ],
-  "immediate_actions": [
-    "A1: kubectl get pods -n {namespace} --field-selector=status.phase!=Running ile basla",
-    "A2: Ikinci acil aksiyon - spesifik komut veya adimla",
-    "A3: Ucuncu acil aksiyon"
-  ],
-  "preventive_actions": [
-    "P1: Tekrari onleyecek mimari veya konfigurasyon degisikligi",
-    "P2: Izleme ve erken uyari iyilestirmesi"
-  ],
-  "timeline": "Sorunun zaman akisi: ne zaman basladi, ne kadar surdu, ne zaman cozuldu."
-}}""".format(
-        display_id=problem.get("displayId", "N/A"),
-        title=problem.get("title", "N/A"),
-        severity=problem.get("severityLevel", "N/A"),
-        status=problem.get("status", "N/A"),
-        rc_name=rc_name,
-        affected=", ".join(affected[:5]) if affected else "Belirsiz",
-        namespace=namespace,
-        start_str=ev_data["start_str"] or "Bilinmiyor",
-        end_str=ev_data["end_str"] or "Devam ediyor",
-        duration=ev_data["duration_str"] or "Belirsiz",
-        total_calls=str(total_calls),
-        evidence_block=evidence_block,
-        downstream_block=downstream_block,
-        log_section=log_section,
-        details=clean_det,
+    # Prompt parcalarini guvenlice birlestir (DT verisi { } icerebildigi icin .format() yerine degisken atama)
+    prompt = (
+        "Sen kıdemli bir SRE ve Site Reliability Engineer'sın. "
+        "ITIL v4 ve PMI PMBOK standartlarinda Root Cause Analysis uretiyorsun.\n\n"
+        "PROBLEM OZETI:\n"
+        "- ID: "
+        + problem.get("displayId", "N/A")
+        + " | Baslik: "
+        + problem.get("title", "N/A")
+        + "\n"
+        "- Severity: "
+        + problem.get("severityLevel", "N/A")
+        + " | Status: "
+        + problem.get("status", "N/A")
+        + "\n"
+        "- Root Cause Servis: " + rc_name + "\n"
+        "- Etkilenen Servisler: "
+        + (", ".join(affected[:5]) if affected else "Belirsiz")
+        + "\n"
+        "- Namespace: " + namespace + "\n"
+        "- Baslangic: "
+        + (ev_data["start_str"] or "Bilinmiyor")
+        + " | Bitis: "
+        + (ev_data["end_str"] or "Devam ediyor")
+        + " | Sure: "
+        + (ev_data["duration_str"] or "Belirsiz")
+        + "\n"
+        "- Toplam Etkilenen Cagri: " + str(total_calls) + "\n\n"
+        "DYNATRACE EVIDENCE (Baseline karsilastirma verileri):\n"
+        + evidence_block
+        + "\n\n"
+        "DOWNSTREAM ETKI:\n" + downstream_block + "\n\n"
+        "LOG KAYITLARI:\n" + log_section + "\n\n"
+        "DETAYLAR:\n" + clean_det + "\n\n"
+        "KRITIK TALIMAT: Asagidaki JSON formatinda DETAYLI analiz uret. Turkce yaz. "
+        "Her alan icin gercek sayisal verileri kullan. "
+        "Evidence'daki baseline sayilarini mutlaka belirt "
+        "(ornek: P90 yanit suresi 3.89s'den 9.51s'ye yukseldi, yuzde 144 artis). "
+        "Sadece JSON dondur, baska metin ekleme:\n\n"
+        "{\n"
+        '  "root_cause": "3-4 cumle. Gercek baseline sayilarini kullanarak teknik kok nedeni acikla.",\n'
+        '  "confidence": "HIGH veya MEDIUM veya LOW",\n'
+        '  "severity_assessment": "Critical veya High veya Medium veya Low",\n'
+        '  "repeat_risk": "High veya Medium veya Low",\n'
+        '  "itil_category": "Infrastructure Failure veya Application Error veya Performance Degradation veya Security",\n'
+        '  "pattern_analysis": "Tek cumle: P50 mi P90 mu etkilendi, sporadic mi surekli mi, yuk bagimliligi var mi.",\n'
+        '  "blast_radius": "Etkilenen servis sayisi, downstream cagri sayisi ve kullanici etkisini belirt.",\n'
+        '  "hypotheses": ["H1: En yuksek olasilikli hipotez", "H2: Ikinci hipotez", "H3: Ucuncu hipotez"],\n'
+        '  "contributing_factors": ["F1: Katkida bulunan faktor", "F2: Ikinci faktor"],\n'
+        '  "immediate_actions": [\n'
+        '    "A1: kubectl get pods -n '
+        + namespace
+        + ' --field-selector=status.phase!=Running ile basla",\n'
+        '    "A2: Ikinci acil aksiyon - spesifik komut veya adimla",\n'
+        '    "A3: Ucuncu acil aksiyon"\n'
+        "  ],\n"
+        '  "preventive_actions": [\n'
+        '    "P1: Tekrari onleyecek mimari veya konfigurasyon degisikligi",\n'
+        '    "P2: Izleme ve erken uyari iyilestirmesi"\n'
+        "  ],\n"
+        '  "timeline": "Sorunun zaman akisi: ne zaman basladi, ne kadar surdu, ne zaman cozuldu."\n'
+        "}"
     )
 
     response = requests.post(
