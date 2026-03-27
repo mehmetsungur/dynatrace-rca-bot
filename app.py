@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Dynatrace -> Claude API -> Microsoft Teams | RCA Bot v1.6
-- 4xx/5xx hata adetleri + peak oran + max/avg response time (DT Metrics API)
+- 4xx/5xx hata adetleri + peak oran + max/avg response time (tek API cagrisi)
+- Yeni DT token ile metrik API erisimi aktif
 - Entity ID: rootCauseEntity > affectedEntities[0] zincirleme
 - HTTP metrikleri erisilemezse sessizce atlanir (fallback safe)
 - Onceki v1.5 ozellikleri korundu (baseline, downstream, pattern, timeline)
@@ -9,34 +10,25 @@ import os, re, json, logging, requests
 from flask import Flask, request, jsonify
 from datetime import datetime, timezone
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 app = Flask(__name__)
 
-DT_BASE_URL = os.environ.get("DT_BASE_URL", "").rstrip("/")
-DT_API_TOKEN = os.environ.get("DT_API_TOKEN", "")
+DT_BASE_URL    = os.environ.get("DT_BASE_URL", "").rstrip("/")
+DT_API_TOKEN   = os.environ.get("DT_API_TOKEN", "")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
-TEAMS_WEBHOOK = os.environ.get("TEAMS_WEBHOOK", "")
+TEAMS_WEBHOOK  = os.environ.get("TEAMS_WEBHOOK", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 
 def dt_headers():
-    return {
-        "Authorization": "Api-Token " + DT_API_TOKEN,
-        "Content-Type": "application/json",
-    }
+    return {"Authorization": "Api-Token " + DT_API_TOKEN, "Content-Type": "application/json"}
 
 
 def find_problem_by_display_id(display_id):
     try:
-        r = requests.get(
-            DT_BASE_URL + "/api/v2/problems",
-            headers=dt_headers(),
-            params={"from": "now-2h", "pageSize": 50, "sort": "-startTime"},
-            timeout=15,
-        )
+        r = requests.get(DT_BASE_URL + "/api/v2/problems", headers=dt_headers(),
+            params={"from": "now-2h", "pageSize": 50, "sort": "-startTime"}, timeout=15)
         r.raise_for_status()
         for p in r.json().get("problems", []):
             if p.get("displayId") == display_id:
@@ -48,11 +40,8 @@ def find_problem_by_display_id(display_id):
 
 def get_problem_details(internal_id):
     try:
-        r = requests.get(
-            DT_BASE_URL + "/api/v2/problems/" + internal_id,
-            headers=dt_headers(),
-            timeout=15,
-        )
+        r = requests.get(DT_BASE_URL + "/api/v2/problems/" + internal_id,
+            headers=dt_headers(), timeout=15)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -62,23 +51,11 @@ def get_problem_details(internal_id):
 
 def get_recent_logs(start_ts):
     try:
-        from_t = datetime.fromtimestamp(
-            start_ts / 1000 - 120, tz=timezone.utc
-        ).strftime("%Y-%m-%dT%H:%M:%SZ")
-        to_t = datetime.fromtimestamp(start_ts / 1000 + 600, tz=timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
-        r = requests.get(
-            DT_BASE_URL + "/api/v2/logs/search",
-            headers=dt_headers(),
-            params={"from": from_t, "to": to_t, "query": "error", "limit": 10},
-            timeout=15,
-        )
-        return [
-            i.get("content", "")[:250]
-            for i in r.json().get("results", [])
-            if i.get("content")
-        ]
+        from_t = datetime.fromtimestamp(start_ts/1000-120, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        to_t   = datetime.fromtimestamp(start_ts/1000+600, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r = requests.get(DT_BASE_URL + "/api/v2/logs/search", headers=dt_headers(),
+            params={"from": from_t, "to": to_t, "query": "error", "limit": 10}, timeout=15)
+        return [i.get("content","")[:250] for i in r.json().get("results",[]) if i.get("content")]
     except Exception as e:
         log.warning("Log sorgusu basarisiz: %s", e)
     return []
@@ -86,98 +63,96 @@ def get_recent_logs(start_ts):
 
 def get_http_metrics(entity_id, start_ts, end_ts):
     """
-    Etkilenen servis icin 4xx/5xx adet + oran + max response time ceker.
-    entity_id: "SERVICE-XXXX"
-    start_ts / end_ts: Unix ms  (0 veya -1 ise son 1 saat kullanilir)
+    Etkilenen servis icin 4xx/5xx adet + oran + max/avg response time ceker.
+    Tek API cagrisiyla 5 metrik birden alinir (verimli).
+    entity_id : "SERVICE-XXXX"
+    start_ts  : Unix ms — problem baslangici (0 ise son 1 saat)
+    end_ts    : Unix ms — problem bitisi  (-1 ise simdi)
     Donus: {fivexx_count, fivexx_peak_rate, fourxx_count, fourxx_peak_rate,
             total_errors, response_time_max_ms, response_time_avg_ms} veya {}
     """
     if not entity_id:
         return {}
     try:
-        # Zaman araligi
+        # Zaman araligi: problem baslangicından 30 dk once → bitis + 5 dk
         if start_ts and start_ts > 0:
             from_dt = datetime.fromtimestamp(
-                max(start_ts / 1000 - 1800, 0), tz=timezone.utc
-            )
+                max(start_ts / 1000 - 1800, 0), tz=timezone.utc)
         else:
             from_dt = datetime.fromtimestamp(
-                datetime.now(timezone.utc).timestamp() - 3600, tz=timezone.utc
-            )
+                datetime.now(timezone.utc).timestamp() - 3600, tz=timezone.utc)
         if end_ts and end_ts > 0:
             to_dt = datetime.fromtimestamp(end_ts / 1000 + 300, tz=timezone.utc)
         else:
             to_dt = datetime.now(timezone.utc)
 
         from_str = from_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        to_str = to_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        es = 'entityId("%s")' % entity_id
+        to_str   = to_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        es       = 'entityId("%s")' % entity_id
 
-        def _query(selector):
-            r = requests.get(
-                DT_BASE_URL + "/api/v2/metrics/query",
-                headers=dt_headers(),
-                params={
-                    "metricSelector": selector,
-                    "entitySelector": es,
-                    "from": from_str,
-                    "to": to_str,
-                    "resolution": "5m",
-                },
-                timeout=20,
-            )
-            r.raise_for_status()
-            result = r.json().get("result", [])
-            if result:
-                vals = result[0].get("data", [{}])[0].get("values", [])
-                return [v for v in vals if v is not None]
-            return []
+        # Tek cagriyla 5 metrik birden
+        COMBINED = (
+            "builtin:service.errors.fivexx.rate,"
+            "builtin:service.errors.fourxx.rate,"
+            "builtin:service.requestCount.total,"
+            "builtin:service.errors.total.count,"
+            "builtin:service.response.time:max,"
+            "builtin:service.response.time"
+        )
+        r = requests.get(
+            DT_BASE_URL + "/api/v2/metrics/query",
+            headers=dt_headers(),
+            params={"metricSelector": COMBINED, "entitySelector": es,
+                    "from": from_str, "to": to_str, "resolution": "5m"},
+            timeout=25,
+        )
+        r.raise_for_status()
 
-        fivexx_rates = _query("builtin:service.errors.fivexx.rate")
-        fourxx_rates = _query("builtin:service.errors.fourxx.rate")
-        total_counts = _query("builtin:service.requestCount.total")
-        error_counts = _query("builtin:service.errors.total.count")
-        rt_max_vals = _query("builtin:service.response.time:max")
-        rt_avg_vals = _query("builtin:service.response.time")
+        # Sonuclari metrik ID'ye gore indeksle
+        raw = {}
+        for series in r.json().get("result", []):
+            mid  = series.get("metricId", "")
+            data = series.get("data", [{}])
+            vals = data[0].get("values", []) if data else []
+            raw[mid] = [v for v in vals if v is not None]
 
-        def _peak(lst):
-            return round(max(lst), 2) if lst else 0
+        def _peak(lst): return round(max(lst), 2) if lst else 0
+        def _sum(lst):  return int(sum(lst)) if lst else 0
+        def _avg(lst):  return round(sum(lst) / len(lst), 2) if lst else 0
 
-        def _sum(lst):
-            return int(sum(lst)) if lst else 0
+        fivexx_rates = raw.get("builtin:service.errors.fivexx.rate", [])
+        fourxx_rates = raw.get("builtin:service.errors.fourxx.rate", [])
+        total_counts = raw.get("builtin:service.requestCount.total", [])
+        error_counts = raw.get("builtin:service.errors.total.count", [])
+        rt_max_vals  = raw.get("builtin:service.response.time:max", [])
+        rt_avg_vals  = raw.get("builtin:service.response.time", [])
 
-        def _avg(lst):
-            return round(sum(lst) / len(lst), 2) if lst else 0
-
-        # 5xx/4xx adet: toplam istek * oran / 100
+        # 5xx / 4xx ADET = her dilimde toplam_istek × oran / 100
         fivexx_count = 0
         fourxx_count = 0
-        if total_counts and fivexx_rates:
-            for t, r5 in zip(total_counts, fivexx_rates):
-                fivexx_count += int(round(t * r5 / 100))
-        if total_counts and fourxx_rates:
-            for t, r4 in zip(total_counts, fourxx_rates):
-                fourxx_count += int(round(t * r4 / 100))
+        for i, total in enumerate(total_counts):
+            if i < len(fivexx_rates):
+                fivexx_count += int(round(total * fivexx_rates[i] / 100))
+            if i < len(fourxx_rates):
+                fourxx_count += int(round(total * fourxx_rates[i] / 100))
 
         rt_max_us = _peak(rt_max_vals)
         rt_avg_us = _avg(rt_avg_vals)
 
         result = {
-            "fivexx_count": fivexx_count,
-            "fivexx_peak_rate": _peak(fivexx_rates),
-            "fourxx_count": fourxx_count,
-            "fourxx_peak_rate": _peak(fourxx_rates),
-            "total_errors": _sum(error_counts),
+            "fivexx_count":         fivexx_count,
+            "fivexx_peak_rate":     _peak(fivexx_rates),
+            "fourxx_count":         fourxx_count,
+            "fourxx_peak_rate":     _peak(fourxx_rates),
+            "total_errors":         _sum(error_counts),
             "response_time_max_ms": round(rt_max_us / 1000, 1) if rt_max_us else 0,
             "response_time_avg_ms": round(rt_avg_us / 1000, 1) if rt_avg_us else 0,
         }
         log.info(
-            "HTTP metrikleri: 5xx=%d (peak %.2f%%) 4xx=%d (peak %.2f%%) rt_max=%.1fms",
-            result["fivexx_count"],
-            result["fivexx_peak_rate"],
-            result["fourxx_count"],
-            result["fourxx_peak_rate"],
-            result["response_time_max_ms"],
+            "HTTP metrikleri OK: 5xx=%d(peak %.2f%%) 4xx=%d(peak %.2f%%) rt_max=%.1fms rt_avg=%.1fms",
+            result["fivexx_count"], result["fivexx_peak_rate"],
+            result["fourxx_count"], result["fourxx_peak_rate"],
+            result["response_time_max_ms"], result["response_time_avg_ms"],
         )
         return result
     except Exception as e:
@@ -186,7 +161,7 @@ def get_http_metrics(entity_id, start_ts, end_ts):
 
 
 def clean_placeholders(text):
-    return re.sub(r"\{[A-Za-z][A-Za-z0-9]*\}", "", str(text or ""))
+    return re.sub(r'\{[A-Za-z][A-Za-z0-9]*\}', '', str(text or ''))
 
 
 def get_root_cause_name(problem, details_text):
@@ -207,16 +182,11 @@ def get_root_cause_name(problem, details_text):
                 return val
     title = problem.get("title", "")
     if title:
-        for prefix in (
-            "on Web service ",
-            "on service ",
-            "on web service ",
-            "on Web request service ",
-            "on web request service ",
-        ):
+        for prefix in ("on Web service ", "on service ", "on web service ",
+                       "on Web request service ", "on web request service "):
             if prefix in title.lower():
                 idx = title.lower().index(prefix)
-                candidate = title[idx + len(prefix) :].strip()
+                candidate = title[idx + len(prefix):].strip()
                 if candidate:
                     return candidate
         return title
@@ -251,19 +221,19 @@ def extract_evidence_data(problem):
     - Event tipleri
     """
     evidences = problem.get("evidenceDetails", {}).get("details", [])
-    impacts = problem.get("impactAnalysis", {}).get("impacts", [])
-    start_ts = problem.get("startTime", 0)
-    end_ts = problem.get("endTime", -1)
+    impacts   = problem.get("impactAnalysis", {}).get("impacts", [])
+    start_ts  = problem.get("startTime", 0)
+    end_ts    = problem.get("endTime", -1)
 
     # Zaman bilgisi
     start_str = ""
-    end_str = ""
+    end_str   = ""
     duration_str = ""
     if start_ts:
-        start_dt = datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc)
+        start_dt = datetime.fromtimestamp(start_ts/1000, tz=timezone.utc)
         start_str = start_dt.strftime("%H:%M UTC")
         if end_ts and end_ts > 0:
-            end_dt = datetime.fromtimestamp(end_ts / 1000, tz=timezone.utc)
+            end_dt = datetime.fromtimestamp(end_ts/1000, tz=timezone.utc)
             end_str = end_dt.strftime("%H:%M UTC")
             dur_min = int((end_ts - start_ts) / 60000)
             duration_str = "%d dakika" % dur_min
@@ -275,24 +245,20 @@ def extract_evidence_data(problem):
     baseline_facts = []
 
     for ev in evidences:
-        ev_type = ev.get("evidenceType", "")
-        ev_name = ev.get("displayName", "")
-        ent_name = ev.get("entity", {}).get("name", "")
-        props = {p["key"]: p["value"] for p in ev.get("data", {}).get("properties", [])}
-        desc = props.get("dt.event.description", "")[:300]
-        rc_rel = ev.get("rootCauseRelevant", False)
-        unit = ev.get("unit", "")
+        ev_type   = ev.get("evidenceType", "")
+        ev_name   = ev.get("displayName", "")
+        ent_name  = ev.get("entity", {}).get("name", "")
+        props     = {p["key"]: p["value"] for p in ev.get("data", {}).get("properties", [])}
+        desc      = props.get("dt.event.description", "")[:300]
+        rc_rel    = ev.get("rootCauseRelevant", False)
+        unit      = ev.get("unit", "")
 
         # TRANSACTIONAL evidence - daha fazla sayisal veri var
         before_val = ev.get("valueBeforeChangePoint")
-        after_val = ev.get("valueAfterChangePoint")
+        after_val  = ev.get("valueAfterChangePoint")
 
         line = "- [%s][%s] %s: %s" % (
-            ev_type,
-            "ROOT_CAUSE" if rc_rel else "CONTEXT",
-            ent_name,
-            desc,
-        )
+            ev_type, "ROOT_CAUSE" if rc_rel else "CONTEXT", ent_name, desc)
         ev_lines.append(line)
 
         if before_val is not None and after_val is not None:
@@ -300,41 +266,17 @@ def extract_evidence_data(problem):
                 b_fmt = _format_ms(before_val)
                 a_fmt = _format_ms(after_val)
                 try:
-                    ratio = (
-                        float(after_val) / float(before_val)
-                        if float(before_val) > 0
-                        else 0
-                    )
-                    change = (
-                        "%.0f%% artis" % ((ratio - 1) * 100)
-                        if ratio > 1
-                        else "%.0f%% azalis" % ((1 - ratio) * 100)
-                    )
+                    ratio = float(after_val) / float(before_val) if float(before_val) > 0 else 0
+                    change = "%.0f%% artis" % ((ratio - 1) * 100) if ratio > 1 else "%.0f%% azalis" % ((1 - ratio) * 100)
                 except Exception:
                     change = ""
                 ev_lines.append("  %s: %s → %s (%s)" % (ev_name, b_fmt, a_fmt, change))
-                ev_card_lines.append(
-                    "%s: %s → %s (%s)" % (ev_name, b_fmt, a_fmt, change)
-                )
-                baseline_facts.append(
-                    {"title": ev_name, "value": "%s → %s (%s)" % (b_fmt, a_fmt, change)}
-                )
+                ev_card_lines.append("%s: %s → %s (%s)" % (ev_name, b_fmt, a_fmt, change))
+                baseline_facts.append({"title": ev_name, "value": "%s → %s (%s)" % (b_fmt, a_fmt, change)})
             elif "PerMinute" in unit or "throughput" in ev_name.lower():
-                ev_lines.append(
-                    "  %s throughput: %.1f/dk → %.1f/dk"
-                    % (ev_name, float(before_val), float(after_val))
-                )
-                ev_card_lines.append(
-                    "%s: %.1f/dk → %.1f/dk"
-                    % (ev_name, float(before_val), float(after_val))
-                )
-                baseline_facts.append(
-                    {
-                        "title": ev_name,
-                        "value": "%.1f → %.1f /dk"
-                        % (float(before_val), float(after_val)),
-                    }
-                )
+                ev_lines.append("  %s throughput: %.1f/dk → %.1f/dk" % (ev_name, float(before_val), float(after_val)))
+                ev_card_lines.append("%s: %.1f/dk → %.1f/dk" % (ev_name, float(before_val), float(after_val)))
+                baseline_facts.append({"title": ev_name, "value": "%.1f → %.1f /dk" % (float(before_val), float(after_val))})
 
         # Error rate baseline
         err_ref = props.get("dt.event.baseline.error_rate_reference", "")
@@ -344,19 +286,9 @@ def extract_evidence_data(problem):
                 b_pct = float(err_ref) * 100
                 a_pct = float(err_cur) * 100
                 ratio = a_pct / b_pct if b_pct > 0 else 0
-                ev_lines.append(
-                    "  Hata orani: %.4f%% → %.4f%% (%.1fx artis)"
-                    % (b_pct, a_pct, ratio)
-                )
-                ev_card_lines.append(
-                    "Hata orani: %.4f%% → %.4f%% (%.1fx artis)" % (b_pct, a_pct, ratio)
-                )
-                baseline_facts.append(
-                    {
-                        "title": "Hata Orani",
-                        "value": "%.4f%% → %.4f%% (%.1fx)" % (b_pct, a_pct, ratio),
-                    }
-                )
+                ev_lines.append("  Hata orani: %.4f%% → %.4f%% (%.1fx artis)" % (b_pct, a_pct, ratio))
+                ev_card_lines.append("Hata orani: %.4f%% → %.4f%% (%.1fx artis)" % (b_pct, a_pct, ratio))
+                baseline_facts.append({"title": "Hata Orani", "value": "%.4f%% → %.4f%% (%.1fx)" % (b_pct, a_pct, ratio)})
             except Exception:
                 pass
 
@@ -370,21 +302,12 @@ def extract_evidence_data(problem):
                 p90_cur = float(rt_p90)
                 p90_ref = float(rt_p90_ref)
                 chg = ((p90_cur - p90_ref) / p90_ref * 100) if p90_ref > 0 else 0
-                ev_lines.append(
-                    "  P90 yanit suresi: %s → %s (%+.1f%%)"
-                    % (_format_ms(p90_ref), _format_ms(p90_cur), chg)
-                )
-                ev_card_lines.append(
-                    "P90: %s → %s (%+.1f%%)"
-                    % (_format_ms(p90_ref), _format_ms(p90_cur), chg)
-                )
-                baseline_facts.append(
-                    {
-                        "title": "P90 Yanit Suresi",
-                        "value": "%s → %s (%+.1f%%)"
-                        % (_format_ms(p90_ref), _format_ms(p90_cur), chg),
-                    }
-                )
+                ev_lines.append("  P90 yanit suresi: %s → %s (%+.1f%%)" % (
+                    _format_ms(p90_ref), _format_ms(p90_cur), chg))
+                ev_card_lines.append("P90: %s → %s (%+.1f%%)" % (
+                    _format_ms(p90_ref), _format_ms(p90_cur), chg))
+                baseline_facts.append({"title": "P90 Yanit Suresi", "value": "%s → %s (%+.1f%%)" % (
+                    _format_ms(p90_ref), _format_ms(p90_cur), chg)})
             except Exception:
                 pass
         if rt_p50 and rt_p50_ref:
@@ -392,21 +315,12 @@ def extract_evidence_data(problem):
                 p50_cur = float(rt_p50)
                 p50_ref = float(rt_p50_ref)
                 chg = ((p50_cur - p50_ref) / p50_ref * 100) if p50_ref > 0 else 0
-                ev_lines.append(
-                    "  P50 yanit suresi: %s → %s (%+.1f%%)"
-                    % (_format_ms(p50_ref), _format_ms(p50_cur), chg)
-                )
-                ev_card_lines.append(
-                    "P50: %s → %s (%+.1f%%)"
-                    % (_format_ms(p50_ref), _format_ms(p50_cur), chg)
-                )
-                baseline_facts.append(
-                    {
-                        "title": "P50 Yanit Suresi",
-                        "value": "%s → %s (%+.1f%%)"
-                        % (_format_ms(p50_ref), _format_ms(p50_cur), chg),
-                    }
-                )
+                ev_lines.append("  P50 yanit suresi: %s → %s (%+.1f%%)" % (
+                    _format_ms(p50_ref), _format_ms(p50_cur), chg))
+                ev_card_lines.append("P50: %s → %s (%+.1f%%)" % (
+                    _format_ms(p50_ref), _format_ms(p50_cur), chg))
+                baseline_facts.append({"title": "P50 Yanit Suresi", "value": "%s → %s (%+.1f%%)" % (
+                    _format_ms(p50_ref), _format_ms(p50_cur), chg)})
             except Exception:
                 pass
 
@@ -420,49 +334,38 @@ def extract_evidence_data(problem):
     downstream_lines = []
     total_downstream = 0
     for imp in impacts:
-        imp_name = imp.get("impactedEntity", {}).get("name", "")
+        imp_name  = imp.get("impactedEntity", {}).get("name", "")
         imp_calls = imp.get("numberOfPotentiallyAffectedServiceCalls", 0)
         total_downstream += imp_calls
         downstream_lines.append("%s: %d cagri etkilendi" % (imp_name[:60], imp_calls))
 
     return {
-        "ev_lines": ev_lines,
-        "ev_card_lines": ev_card_lines,
-        "baseline_facts": baseline_facts,
+        "ev_lines":         ev_lines,
+        "ev_card_lines":    ev_card_lines,
+        "baseline_facts":   baseline_facts,
         "downstream_lines": downstream_lines,
         "total_downstream": total_downstream,
-        "start_str": start_str,
-        "end_str": end_str,
-        "duration_str": duration_str,
+        "start_str":        start_str,
+        "end_str":          end_str,
+        "duration_str":     duration_str,
     }
 
 
 # ── CLAUDE PROMPT ─────────────────────────────────────────────────────────────
 
-
 def ask_claude(problem, details_text, logs, rc_name):
     ev_data = extract_evidence_data(problem)
 
-    affected = [e["name"] for e in problem.get("affectedEntities", [])]
-    ns = problem.get("k8s.namespace.name")
-    namespace = (ns[0] if isinstance(ns, list) and ns else ns) or "N/A"
-    log_section = (
-        "\n".join(logs[:6]) if logs else "Log alinamadi (ic ag erisim kisitli)."
-    )
-    clean_det = clean_placeholders(details_text)[:800]
-    impacts = problem.get("impactAnalysis", {}).get("impacts", [])
-    total_calls = sum(
-        i.get("numberOfPotentiallyAffectedServiceCalls", 0) for i in impacts
-    )
+    affected    = [e["name"] for e in problem.get("affectedEntities", [])]
+    ns          = problem.get("k8s.namespace.name")
+    namespace   = (ns[0] if isinstance(ns, list) and ns else ns) or "N/A"
+    log_section = "\n".join(logs[:6]) if logs else "Log alinamadi (ic ag erisim kisitli)."
+    clean_det   = clean_placeholders(details_text)[:800]
+    impacts     = problem.get("impactAnalysis", {}).get("impacts", [])
+    total_calls = sum(i.get("numberOfPotentiallyAffectedServiceCalls", 0) for i in impacts)
 
-    downstream_block = (
-        "\n".join(ev_data["downstream_lines"])
-        if ev_data["downstream_lines"]
-        else "Downstream etki yok."
-    )
-    evidence_block = (
-        "\n".join(ev_data["ev_lines"]) if ev_data["ev_lines"] else "Evidence alinamadi."
-    )
+    downstream_block = "\n".join(ev_data["downstream_lines"]) if ev_data["downstream_lines"] else "Downstream etki yok."
+    evidence_block   = "\n".join(ev_data["ev_lines"]) if ev_data["ev_lines"] else "Evidence alinamadi."
 
     prompt = """Sen kıdemli bir SRE ve Site Reliability Engineer'sın. ITIL v4 ve PMI PMBOK standartlarinda Root Cause Analysis uretiyorsun.
 
@@ -519,35 +422,29 @@ Sadece JSON dondur, baska metin ekleme:
   ],
   "timeline": "Sorunun zaman akisi: ne zaman basladi, ne kadar surdu, ne zaman cozuldu."
 }}""".format(
-        display_id=problem.get("displayId", "N/A"),
-        title=problem.get("title", "N/A"),
-        severity=problem.get("severityLevel", "N/A"),
-        status=problem.get("status", "N/A"),
-        rc_name=rc_name,
-        affected=", ".join(affected[:5]) if affected else "Belirsiz",
-        namespace=namespace,
-        start_str=ev_data["start_str"] or "Bilinmiyor",
-        end_str=ev_data["end_str"] or "Devam ediyor",
-        duration=ev_data["duration_str"] or "Belirsiz",
-        total_calls=str(total_calls),
-        evidence_block=evidence_block,
-        downstream_block=downstream_block,
-        log_section=log_section,
-        details=clean_det,
+        display_id    = problem.get("displayId","N/A"),
+        title         = problem.get("title","N/A"),
+        severity      = problem.get("severityLevel","N/A"),
+        status        = problem.get("status","N/A"),
+        rc_name       = rc_name,
+        affected      = ", ".join(affected[:5]) if affected else "Belirsiz",
+        namespace     = namespace,
+        start_str     = ev_data["start_str"] or "Bilinmiyor",
+        end_str       = ev_data["end_str"] or "Devam ediyor",
+        duration      = ev_data["duration_str"] or "Belirsiz",
+        total_calls   = str(total_calls),
+        evidence_block = evidence_block,
+        downstream_block = downstream_block,
+        log_section   = log_section,
+        details       = clean_det,
     )
 
     response = requests.post(
         "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": CLAUDE_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 2500,
-            "messages": [{"role": "user", "content": prompt}],
-        },
+        headers={"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"},
+        json={"model": "claude-haiku-4-5-20251001", "max_tokens": 2500,
+              "messages": [{"role": "user", "content": prompt}]},
         timeout=90,
     )
     response.raise_for_status()
@@ -561,55 +458,50 @@ Sadece JSON dondur, baska metin ekleme:
 
 # ── TEAMS ADAPTIVE CARD ───────────────────────────────────────────────────────
 
+def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN", http_metrics=None):
+    display_id   = problem.get("displayId", "N/A")
+    title        = problem.get("title", "Unknown")
+    status       = problem.get("status", "OPEN")
+    severity     = problem.get("severityLevel", "")
+    ns           = problem.get("k8s.namespace.name")
+    namespace    = (ns[0] if isinstance(ns, list) and ns else ns) or ""
 
-def build_teams_card(
-    problem, rca, dt_url, rc_name, webhook_state="OPEN", http_metrics=None
-):
-    display_id = problem.get("displayId", "N/A")
-    title = problem.get("title", "Unknown")
-    status = problem.get("status", "OPEN")
-    severity = problem.get("severityLevel", "")
-    ns = problem.get("k8s.namespace.name")
-    namespace = (ns[0] if isinstance(ns, list) and ns else ns) or ""
-
-    is_resolved = (status == "CLOSED") or (webhook_state == "RESOLVED")
-    state_label = "CLOSED" if is_resolved else "OPEN"
-    state_color = "good" if is_resolved else "attention"
-    state_icon = "OK" if is_resolved else "!!"
+    is_resolved  = (status == "CLOSED") or (webhook_state == "RESOLVED")
+    state_label  = "CLOSED"   if is_resolved else "OPEN"
+    state_color  = "good"     if is_resolved else "attention"
+    state_icon   = "OK"       if is_resolved else "!!"
 
     # RCA alanlari
-    root_cause = rca.get("root_cause", "Analiz tamamlanamadi.")
-    confidence = rca.get("confidence", "MEDIUM")
-    severity_ass = rca.get("severity_assessment", "")
-    repeat_risk = rca.get("repeat_risk", "")
-    itil_cat = rca.get("itil_category", "")
+    root_cause       = rca.get("root_cause", "Analiz tamamlanamadi.")
+    confidence       = rca.get("confidence", "MEDIUM")
+    severity_ass     = rca.get("severity_assessment", "")
+    repeat_risk      = rca.get("repeat_risk", "")
+    itil_cat         = rca.get("itil_category", "")
     pattern_analysis = rca.get("pattern_analysis", "")
-    blast_radius = rca.get("blast_radius", "")
-    timeline = rca.get("timeline", "")
+    blast_radius     = rca.get("blast_radius", "")
+    timeline         = rca.get("timeline", "")
 
-    hyp_list = rca.get("hypotheses", [])
-    imm_list = rca.get("immediate_actions", [])
+    hyp_list  = rca.get("hypotheses", [])
+    imm_list  = rca.get("immediate_actions", [])
     prev_list = rca.get("preventive_actions", [])
-    con_list = rca.get("contributing_factors", [])
+    con_list  = rca.get("contributing_factors", [])
 
-    hyp_text = "\n".join("%d. %s" % (i + 1, h) for i, h in enumerate(hyp_list))
-    imm_text = "\n".join("%d. %s" % (i + 1, a) for i, a in enumerate(imm_list))
-    prev_text = "\n".join("%d. %s" % (i + 1, a) for i, a in enumerate(prev_list))
-    con_text = "\n".join("- %s" % c for c in con_list)
+    hyp_text  = "\n".join("%d. %s" % (i+1, h) for i, h in enumerate(hyp_list))
+    imm_text  = "\n".join("%d. %s" % (i+1, a) for i, a in enumerate(imm_list))
+    prev_text = "\n".join("%d. %s" % (i+1, a) for i, a in enumerate(prev_list))
+    con_text  = "\n".join("- %s" % c for c in con_list)
 
     # Evidence verisi
     ev_data = extract_evidence_data(problem)
-    baseline_facts = ev_data["baseline_facts"]
-    downstream_lines = ev_data["downstream_lines"]
-    ev_card_text = (
-        "\n".join(ev_data["ev_card_lines"]) if ev_data["ev_card_lines"] else ""
-    )
+    baseline_facts    = ev_data["baseline_facts"]
+    downstream_lines  = ev_data["downstream_lines"]
+    ev_card_text      = "\n".join(ev_data["ev_card_lines"]) if ev_data["ev_card_lines"] else ""
 
     # Ana kart fact'leri
     main_facts = [
-        {"title": "State", "value": state_label},
+        {"title": "State",      "value": state_label},
         {"title": "Problem ID", "value": display_id},
-        {"title": "Severity", "value": severity},
+        {"title": "Severity",   "value": severity},
         {"title": "Root Cause", "value": rc_name},
     ]
     if namespace:
@@ -621,349 +513,152 @@ def build_teams_card(
     rca_body = []
 
     # 1. Baslik + root cause
-    rca_body.append(
-        {
-            "type": "TextBlock",
-            "text": "Root Cause Analysis",
-            "weight": "Bolder",
-            "size": "Medium",
-            "color": "Attention",
-            "spacing": "None",
-        }
-    )
-    rca_body.append(
-        {
-            "type": "TextBlock",
-            "text": root_cause,
-            "wrap": True,
-            "size": "Small",
-            "spacing": "Small",
-        }
-    )
+    rca_body.append({"type": "TextBlock", "text": "Root Cause Analysis",
+        "weight": "Bolder", "size": "Medium", "color": "Attention", "spacing": "None"})
+    rca_body.append({"type": "TextBlock", "text": root_cause,
+        "wrap": True, "size": "Small", "spacing": "Small"})
 
     # 2. Ozet FactSet
-    rca_body.append(
-        {
-            "type": "FactSet",
-            "spacing": "Small",
-            "facts": [
-                {"title": "Root Cause Servis", "value": rc_name},
-                {"title": "Confidence", "value": confidence},
-                {"title": "Severity", "value": severity_ass},
-                {"title": "Repeat Risk", "value": repeat_risk},
-                {"title": "ITIL Kategori", "value": itil_cat},
-            ],
-        }
-    )
+    rca_body.append({"type": "FactSet", "spacing": "Small", "facts": [
+        {"title": "Root Cause Servis", "value": rc_name},
+        {"title": "Confidence",        "value": confidence},
+        {"title": "Severity",          "value": severity_ass},
+        {"title": "Repeat Risk",       "value": repeat_risk},
+        {"title": "ITIL Kategori",     "value": itil_cat},
+    ]})
 
     # 3. Timeline (varsa)
     if timeline:
-        rca_body.append(
-            {
-                "type": "TextBlock",
-                "text": "Zaman Akisi",
-                "weight": "Bolder",
-                "size": "Small",
-                "color": "Accent",
-                "spacing": "Medium",
-            }
-        )
-        rca_body.append(
-            {"type": "TextBlock", "text": timeline, "wrap": True, "size": "Small"}
-        )
+        rca_body.append({"type": "TextBlock", "text": "Zaman Akisi",
+            "weight": "Bolder", "size": "Small", "color": "Accent", "spacing": "Medium"})
+        rca_body.append({"type": "TextBlock", "text": timeline,
+            "wrap": True, "size": "Small"})
 
     # 4. Pattern analizi (varsa)
     if pattern_analysis:
-        rca_body.append(
-            {
-                "type": "TextBlock",
-                "text": "Hata Paterni",
-                "weight": "Bolder",
-                "size": "Small",
-                "color": "Accent",
-                "spacing": "Medium",
-            }
-        )
-        rca_body.append(
-            {
-                "type": "TextBlock",
-                "text": pattern_analysis,
-                "wrap": True,
-                "size": "Small",
-            }
-        )
+        rca_body.append({"type": "TextBlock", "text": "Hata Paterni",
+            "weight": "Bolder", "size": "Small", "color": "Accent", "spacing": "Medium"})
+        rca_body.append({"type": "TextBlock", "text": pattern_analysis,
+            "wrap": True, "size": "Small"})
 
     # 5. Blast radius (varsa)
     if blast_radius:
-        rca_body.append(
-            {
-                "type": "TextBlock",
-                "text": "Etki Alani",
-                "weight": "Bolder",
-                "size": "Small",
-                "spacing": "Medium",
-            }
-        )
-        rca_body.append(
-            {"type": "TextBlock", "text": blast_radius, "wrap": True, "size": "Small"}
-        )
+        rca_body.append({"type": "TextBlock", "text": "Etki Alani",
+            "weight": "Bolder", "size": "Small", "spacing": "Medium"})
+        rca_body.append({"type": "TextBlock", "text": blast_radius,
+            "wrap": True, "size": "Small"})
 
     # 6. Dynatrace Baseline Evidence (gercek sayilar)
     if baseline_facts:
-        rca_body.append(
-            {
-                "type": "TextBlock",
-                "text": "Dynatrace Baseline Verileri",
-                "weight": "Bolder",
-                "size": "Small",
-                "color": "Accent",
-                "spacing": "Medium",
-            }
-        )
+        rca_body.append({"type": "TextBlock", "text": "Dynatrace Baseline Verileri",
+            "weight": "Bolder", "size": "Small", "color": "Accent", "spacing": "Medium"})
         rca_body.append({"type": "FactSet", "facts": baseline_facts})
     elif ev_card_text:
-        rca_body.append(
-            {
-                "type": "TextBlock",
-                "text": "Dynatrace Evidence",
-                "weight": "Bolder",
-                "size": "Small",
-                "color": "Accent",
-                "spacing": "Medium",
-            }
-        )
-        rca_body.append(
-            {
-                "type": "TextBlock",
-                "text": ev_card_text,
-                "wrap": True,
-                "size": "Small",
-                "isSubtle": True,
-            }
-        )
+        rca_body.append({"type": "TextBlock", "text": "Dynatrace Evidence",
+            "weight": "Bolder", "size": "Small", "color": "Accent", "spacing": "Medium"})
+        rca_body.append({"type": "TextBlock", "text": ev_card_text,
+            "wrap": True, "size": "Small", "isSubtle": True})
 
     # 7. Downstream etki
     if downstream_lines:
-        rca_body.append(
-            {
-                "type": "TextBlock",
-                "text": "Downstream Etki (%d servis cagri)"
-                % ev_data["total_downstream"],
-                "weight": "Bolder",
-                "size": "Small",
-                "spacing": "Medium",
-            }
-        )
-        rca_body.append(
-            {
-                "type": "TextBlock",
-                "text": "\n".join(downstream_lines[:5]),
-                "wrap": True,
-                "size": "Small",
-                "isSubtle": True,
-            }
-        )
+        rca_body.append({"type": "TextBlock", "text": "Downstream Etki (%d servis cagri)" % ev_data["total_downstream"],
+            "weight": "Bolder", "size": "Small", "spacing": "Medium"})
+        rca_body.append({"type": "TextBlock",
+            "text": "\n".join(downstream_lines[:5]),
+            "wrap": True, "size": "Small", "isSubtle": True})
 
     # 7b. HTTP Metrikleri (4xx/5xx adet + response time max)
     m = http_metrics or {}
-    if m and (
-        m.get("fivexx_count", 0) > 0
-        or m.get("fourxx_count", 0) > 0
-        or m.get("response_time_max_ms", 0) > 0
-    ):
+    if m and (m.get("fivexx_count", 0) > 0 or m.get("fourxx_count", 0) > 0
+              or m.get("response_time_max_ms", 0) > 0):
         http_facts = []
         if m.get("fivexx_count", 0) > 0 or m.get("fivexx_peak_rate", 0) > 0:
-            http_facts.append(
-                {
-                    "title": "5xx Hata Adedi",
-                    "value": "%d istek (peak oran: %.2f%%)"
-                    % (m.get("fivexx_count", 0), m.get("fivexx_peak_rate", 0)),
-                }
-            )
+            http_facts.append({"title": "5xx Hata Adedi",
+                "value": "%d istek (peak oran: %.2f%%)" % (
+                    m.get("fivexx_count", 0), m.get("fivexx_peak_rate", 0))})
         if m.get("fourxx_count", 0) > 0 or m.get("fourxx_peak_rate", 0) > 0:
-            http_facts.append(
-                {
-                    "title": "4xx Hata Adedi",
-                    "value": "%d istek (peak oran: %.2f%%)"
-                    % (m.get("fourxx_count", 0), m.get("fourxx_peak_rate", 0)),
-                }
-            )
+            http_facts.append({"title": "4xx Hata Adedi",
+                "value": "%d istek (peak oran: %.2f%%)" % (
+                    m.get("fourxx_count", 0), m.get("fourxx_peak_rate", 0))})
         if m.get("total_errors", 0) > 0:
-            http_facts.append(
-                {"title": "Toplam Hata", "value": "%d istek" % m.get("total_errors", 0)}
-            )
+            http_facts.append({"title": "Toplam Hata",
+                "value": "%d istek" % m.get("total_errors", 0)})
         if m.get("response_time_max_ms", 0) > 0:
-            http_facts.append(
-                {
-                    "title": "Max Yanit Suresi",
-                    "value": _format_ms(m["response_time_max_ms"] * 1000),
-                }
-            )
+            http_facts.append({"title": "Max Yanit Suresi",
+                "value": _format_ms(m["response_time_max_ms"] * 1000)})
         if m.get("response_time_avg_ms", 0) > 0:
-            http_facts.append(
-                {
-                    "title": "Ort Yanit Suresi",
-                    "value": _format_ms(m["response_time_avg_ms"] * 1000),
-                }
-            )
+            http_facts.append({"title": "Ort Yanit Suresi",
+                "value": _format_ms(m["response_time_avg_ms"] * 1000)})
         if http_facts:
-            rca_body.append(
-                {
-                    "type": "TextBlock",
-                    "text": "HTTP Metrikleri (4xx/5xx/Latency)",
-                    "weight": "Bolder",
-                    "size": "Small",
-                    "color": "Warning",
-                    "spacing": "Medium",
-                }
-            )
+            rca_body.append({"type": "TextBlock",
+                "text": "HTTP Metrikleri (4xx/5xx/Latency)",
+                "weight": "Bolder", "size": "Small", "color": "Warning",
+                "spacing": "Medium"})
             rca_body.append({"type": "FactSet", "facts": http_facts})
 
     # 8. Hipotezler
-    rca_body.append(
-        {
-            "type": "TextBlock",
-            "text": "Hipotezler",
-            "weight": "Bolder",
-            "size": "Small",
-            "spacing": "Medium",
-        }
-    )
-    rca_body.append(
-        {"type": "TextBlock", "text": hyp_text, "wrap": True, "size": "Small"}
-    )
+    rca_body.append({"type": "TextBlock", "text": "Hipotezler",
+        "weight": "Bolder", "size": "Small", "spacing": "Medium"})
+    rca_body.append({"type": "TextBlock", "text": hyp_text,
+        "wrap": True, "size": "Small"})
 
     # 9. Katkida bulunan faktorler
     if con_text:
-        rca_body.append(
-            {
-                "type": "TextBlock",
-                "text": "Katkida Bulunan Faktorler",
-                "weight": "Bolder",
-                "size": "Small",
-                "spacing": "Medium",
-            }
-        )
-        rca_body.append(
-            {"type": "TextBlock", "text": con_text, "wrap": True, "size": "Small"}
-        )
+        rca_body.append({"type": "TextBlock", "text": "Katkida Bulunan Faktorler",
+            "weight": "Bolder", "size": "Small", "spacing": "Medium"})
+        rca_body.append({"type": "TextBlock", "text": con_text,
+            "wrap": True, "size": "Small"})
 
     # 10. Acil aksiyonlar
-    rca_body.append(
-        {
-            "type": "TextBlock",
-            "text": "Acil Aksiyonlar",
-            "weight": "Bolder",
-            "size": "Small",
-            "color": "Attention",
-            "spacing": "Medium",
-        }
-    )
-    rca_body.append(
-        {"type": "TextBlock", "text": imm_text, "wrap": True, "size": "Small"}
-    )
+    rca_body.append({"type": "TextBlock", "text": "Acil Aksiyonlar",
+        "weight": "Bolder", "size": "Small", "color": "Attention", "spacing": "Medium"})
+    rca_body.append({"type": "TextBlock", "text": imm_text,
+        "wrap": True, "size": "Small"})
 
     # 11. Onleyici aksiyonlar
-    rca_body.append(
-        {
-            "type": "TextBlock",
-            "text": "Onleyici Aksiyonlar",
-            "weight": "Bolder",
-            "size": "Small",
-            "spacing": "Medium",
-        }
-    )
-    rca_body.append(
-        {"type": "TextBlock", "text": prev_text, "wrap": True, "size": "Small"}
-    )
+    rca_body.append({"type": "TextBlock", "text": "Onleyici Aksiyonlar",
+        "weight": "Bolder", "size": "Small", "spacing": "Medium"})
+    rca_body.append({"type": "TextBlock", "text": prev_text,
+        "wrap": True, "size": "Small"})
 
     return {
         "type": "message",
-        "attachments": [
-            {
-                "contentType": "application/vnd.microsoft.card.adaptive",
-                "contentUrl": None,
-                "content": {
-                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                    "type": "AdaptiveCard",
-                    "version": "1.4",
-                    "body": [
-                        {
-                            "type": "ColumnSet",
-                            "columns": [
-                                {
-                                    "type": "Column",
-                                    "width": "auto",
-                                    "items": [
-                                        {
-                                            "type": "TextBlock",
-                                            "text": state_icon,
-                                            "weight": "bolder",
-                                            "size": "large",
-                                            "color": state_color,
-                                        }
-                                    ],
-                                },
-                                {
-                                    "type": "Column",
-                                    "width": "stretch",
-                                    "items": [
-                                        {
-                                            "type": "TextBlock",
-                                            "text": "Dynatrace RCA",
-                                            "weight": "bolder",
-                                            "size": "large",
-                                            "color": state_color,
-                                        },
-                                        {
-                                            "type": "TextBlock",
-                                            "text": title,
-                                            "wrap": True,
-                                            "spacing": "None",
-                                        },
-                                    ],
-                                },
-                            ],
-                        },
-                        {"type": "FactSet", "spacing": "Medium", "facts": main_facts},
-                        {
-                            "type": "ActionSet",
-                            "actions": [
-                                {
-                                    "type": "Action.OpenUrl",
-                                    "title": "View in Dynatrace",
-                                    "url": dt_url,
-                                },
-                                {
-                                    "type": "Action.ShowCard",
-                                    "title": "Show Details",
-                                    "card": {
-                                        "type": "AdaptiveCard",
-                                        "body": [
-                                            {
-                                                "type": "TextBlock",
-                                                "text": root_cause,
-                                                "wrap": True,
-                                            }
-                                        ],
-                                    },
-                                },
-                                {
-                                    "type": "Action.ShowCard",
-                                    "title": "Show RCA Analysis",
-                                    "card": {"type": "AdaptiveCard", "body": rca_body},
-                                },
-                            ],
-                        },
-                    ],
-                },
-            }
-        ],
+        "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive",
+                         "contentUrl": None, "content": {
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "type": "AdaptiveCard", "version": "1.4",
+            "body": [
+                {"type": "ColumnSet", "columns": [
+                    {"type": "Column", "width": "auto", "items": [
+                        {"type": "TextBlock", "text": state_icon,
+                         "weight": "bolder", "size": "large", "color": state_color}
+                    ]},
+                    {"type": "Column", "width": "stretch", "items": [
+                        {"type": "TextBlock", "text": "Dynatrace RCA",
+                         "weight": "bolder", "size": "large", "color": state_color},
+                        {"type": "TextBlock", "text": title,
+                         "wrap": True, "spacing": "None"}
+                    ]}
+                ]},
+                {"type": "FactSet", "spacing": "Medium", "facts": main_facts},
+                {"type": "ActionSet", "actions": [
+                    {"type": "Action.OpenUrl",
+                     "title": "View in Dynatrace", "url": dt_url},
+                    {"type": "Action.ShowCard",
+                     "title": "Show Details",
+                     "card": {"type": "AdaptiveCard", "body": [
+                         {"type": "TextBlock", "text": root_cause, "wrap": True}
+                     ]}},
+                    {"type": "Action.ShowCard",
+                     "title": "Show RCA Analysis",
+                     "card": {"type": "AdaptiveCard", "body": rca_body}},
+                ]}
+            ]
+        }}]
     }
 
 
 # ── ORKESTRATÖR ───────────────────────────────────────────────────────────────
-
 
 def process_problem(display_id, problem_title, state, dt_url, details_text):
     log.info("Isleniyor: %s - %s (%s)", display_id, problem_title, state)
@@ -980,30 +675,24 @@ def process_problem(display_id, problem_title, state, dt_url, details_text):
             part = part.strip()
             if "Root Cause" in part:
                 val = part.split(":", 1)[-1].strip()
-                if (
-                    val
-                    and len(val) > 2
-                    and "on Web service" not in val
-                    and "{" not in val
-                ):
+                if val and len(val) > 2 and "on Web service" not in val and "{" not in val:
                     fallback_name = val
                     break
         problem = {
-            "displayId": display_id,
-            "title": problem_title,
-            "status": state,
-            "severityLevel": "ERROR",
-            "impactLevel": "SERVICES",
-            "affectedEntities": [
-                {"name": fallback_name, "entityId": {"id": "", "type": "SERVICE"}}
-            ],
-            "rootCauseEntity": None,
-            "startTime": int(datetime.now(timezone.utc).timestamp() * 1000) - 3600000,
+            "displayId":        display_id,
+            "title":            problem_title,
+            "status":           state,
+            "severityLevel":    "ERROR",
+            "impactLevel":      "SERVICES",
+            "affectedEntities": [{"name": fallback_name,
+                                  "entityId": {"id": "", "type": "SERVICE"}}],
+            "rootCauseEntity":  None,
+            "startTime":        int(datetime.now(timezone.utc).timestamp() * 1000) - 3600000,
         }
 
-    rc_name = get_root_cause_name(problem, details_text)
-    start_ts = problem.get("startTime", 0)
-    end_ts = problem.get("endTime", -1)
+    rc_name   = get_root_cause_name(problem, details_text)
+    start_ts  = problem.get("startTime", 0)
+    end_ts    = problem.get("endTime", -1)
     logs_data = get_recent_logs(start_ts) if start_ts else []
 
     # HTTP metrikleri: entity ID'yi problem'dan al
@@ -1019,20 +708,12 @@ def process_problem(display_id, problem_title, state, dt_url, details_text):
 
     log.info("Claude sorgu: %s (rc: %s)", display_id, rc_name)
     rca = ask_claude(problem, details_text, logs_data, rc_name)
-    log.info(
-        "RCA OK: %s confidence=%s pattern=%s",
-        display_id,
-        rca.get("confidence"),
-        bool(rca.get("pattern_analysis")),
-    )
+    log.info("RCA OK: %s confidence=%s pattern=%s",
+             display_id, rca.get("confidence"), bool(rca.get("pattern_analysis")))
 
     card = build_teams_card(problem, rca, dt_url, rc_name, state, http_metrics)
-    r = requests.post(
-        TEAMS_WEBHOOK,
-        headers={"Content-Type": "application/json"},
-        json=card,
-        timeout=15,
-    )
+    r = requests.post(TEAMS_WEBHOOK, headers={"Content-Type": "application/json"},
+                      json=card, timeout=15)
     if r.ok:
         log.info("Teams OK: %s", display_id)
         return True
@@ -1042,19 +723,18 @@ def process_problem(display_id, problem_title, state, dt_url, details_text):
 
 # ── FLASK ENDPOINTLERİ ────────────────────────────────────────────────────────
 
-
 @app.route("/webhook/dynatrace-rca", methods=["POST"])
 def dynatrace_webhook():
     if WEBHOOK_SECRET:
-        if request.headers.get("X-Webhook-Token", "") != WEBHOOK_SECRET:
+        if request.headers.get("X-Webhook-Token","") != WEBHOOK_SECRET:
             return jsonify({"error": "Unauthorized"}), 401
     data = request.json or {}
     log.info("Webhook alindi: %s", json.dumps(data)[:200])
-    display_id = data.get("ProblemID", "")
+    display_id    = data.get("ProblemID", "")
     problem_title = data.get("ProblemTitle", "")
-    state = data.get("State", "")
-    dt_url = data.get("URL", "")
-    details_text = data.get("Details", "")
+    state         = data.get("State", "")
+    dt_url        = data.get("URL", "")
+    details_text  = data.get("Details", "")
     if state not in ("OPEN", "RESOLVED"):
         log.info("Atlandi: %s state=%s", display_id, state)
         return jsonify({"status": "skipped", "reason": "unknown state"}), 200
@@ -1068,11 +748,8 @@ def dynatrace_webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    missing = [
-        k
-        for k in ["DT_BASE_URL", "DT_API_TOKEN", "CLAUDE_API_KEY", "TEAMS_WEBHOOK"]
-        if not os.environ.get(k)
-    ]
+    missing = [k for k in ["DT_BASE_URL","DT_API_TOKEN","CLAUDE_API_KEY","TEAMS_WEBHOOK"]
+               if not os.environ.get(k)]
     if missing:
         return jsonify({"status": "degraded", "missing_env": missing}), 200
     return jsonify({"status": "ok", "version": "1.6.0"}), 200
