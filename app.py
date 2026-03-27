@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Dynatrace -> Claude API -> Microsoft Teams | RCA Bot v1.5
-- Detayli RCA: baseline sayilari, downstream etki, timeline, pattern analizi
-- Claude JSON sema genisletildi: 12 alan
-- Teams kart: zengin Show RCA Analysis (baseline tablo + downstream + pattern)
-- OPEN kirmizi !! / RESOLVED yesil OK
+"""Dynatrace -> Claude API -> Microsoft Teams | RCA Bot v1.6
+- 4xx/5xx hata adetleri + peak oran + max/avg response time (DT Metrics API)
+- Entity ID: rootCauseEntity > affectedEntities[0] zincirleme
+- HTTP metrikleri erisilemezse sessizce atlanir (fallback safe)
+- Onceki v1.5 ozellikleri korundu (baseline, downstream, pattern, timeline)
 """
 import os, re, json, logging, requests
 from flask import Flask, request, jsonify
@@ -82,6 +82,107 @@ def get_recent_logs(start_ts):
     except Exception as e:
         log.warning("Log sorgusu basarisiz: %s", e)
     return []
+
+
+def get_http_metrics(entity_id, start_ts, end_ts):
+    """
+    Etkilenen servis icin 4xx/5xx adet + oran + max response time ceker.
+    entity_id: "SERVICE-XXXX"
+    start_ts / end_ts: Unix ms  (0 veya -1 ise son 1 saat kullanilir)
+    Donus: {fivexx_count, fivexx_peak_rate, fourxx_count, fourxx_peak_rate,
+            total_errors, response_time_max_ms, response_time_avg_ms} veya {}
+    """
+    if not entity_id:
+        return {}
+    try:
+        # Zaman araligi
+        if start_ts and start_ts > 0:
+            from_dt = datetime.fromtimestamp(
+                max(start_ts / 1000 - 1800, 0), tz=timezone.utc
+            )
+        else:
+            from_dt = datetime.fromtimestamp(
+                datetime.now(timezone.utc).timestamp() - 3600, tz=timezone.utc
+            )
+        if end_ts and end_ts > 0:
+            to_dt = datetime.fromtimestamp(end_ts / 1000 + 300, tz=timezone.utc)
+        else:
+            to_dt = datetime.now(timezone.utc)
+
+        from_str = from_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        to_str = to_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        es = 'entityId("%s")' % entity_id
+
+        def _query(selector):
+            r = requests.get(
+                DT_BASE_URL + "/api/v2/metrics/query",
+                headers=dt_headers(),
+                params={
+                    "metricSelector": selector,
+                    "entitySelector": es,
+                    "from": from_str,
+                    "to": to_str,
+                    "resolution": "5m",
+                },
+                timeout=20,
+            )
+            r.raise_for_status()
+            result = r.json().get("result", [])
+            if result:
+                vals = result[0].get("data", [{}])[0].get("values", [])
+                return [v for v in vals if v is not None]
+            return []
+
+        fivexx_rates = _query("builtin:service.errors.fivexx.rate")
+        fourxx_rates = _query("builtin:service.errors.fourxx.rate")
+        total_counts = _query("builtin:service.requestCount.total")
+        error_counts = _query("builtin:service.errors.total.count")
+        rt_max_vals = _query("builtin:service.response.time:max")
+        rt_avg_vals = _query("builtin:service.response.time")
+
+        def _peak(lst):
+            return round(max(lst), 2) if lst else 0
+
+        def _sum(lst):
+            return int(sum(lst)) if lst else 0
+
+        def _avg(lst):
+            return round(sum(lst) / len(lst), 2) if lst else 0
+
+        # 5xx/4xx adet: toplam istek * oran / 100
+        fivexx_count = 0
+        fourxx_count = 0
+        if total_counts and fivexx_rates:
+            for t, r5 in zip(total_counts, fivexx_rates):
+                fivexx_count += int(round(t * r5 / 100))
+        if total_counts and fourxx_rates:
+            for t, r4 in zip(total_counts, fourxx_rates):
+                fourxx_count += int(round(t * r4 / 100))
+
+        rt_max_us = _peak(rt_max_vals)
+        rt_avg_us = _avg(rt_avg_vals)
+
+        result = {
+            "fivexx_count": fivexx_count,
+            "fivexx_peak_rate": _peak(fivexx_rates),
+            "fourxx_count": fourxx_count,
+            "fourxx_peak_rate": _peak(fourxx_rates),
+            "total_errors": _sum(error_counts),
+            "response_time_max_ms": round(rt_max_us / 1000, 1) if rt_max_us else 0,
+            "response_time_avg_ms": round(rt_avg_us / 1000, 1) if rt_avg_us else 0,
+        }
+        log.info(
+            "HTTP metrikleri: 5xx=%d (peak %.2f%%) 4xx=%d (peak %.2f%%) rt_max=%.1fms",
+            result["fivexx_count"],
+            result["fivexx_peak_rate"],
+            result["fourxx_count"],
+            result["fourxx_peak_rate"],
+            result["response_time_max_ms"],
+        )
+        return result
+    except Exception as e:
+        log.warning("HTTP metrik sorgusu basarisiz (%s): %s", entity_id, e)
+        return {}
 
 
 def clean_placeholders(text):
@@ -461,7 +562,9 @@ Sadece JSON dondur, baska metin ekleme:
 # ── TEAMS ADAPTIVE CARD ───────────────────────────────────────────────────────
 
 
-def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
+def build_teams_card(
+    problem, rca, dt_url, rc_name, webhook_state="OPEN", http_metrics=None
+):
     display_id = problem.get("displayId", "N/A")
     title = problem.get("title", "Unknown")
     status = problem.get("status", "OPEN")
@@ -661,6 +764,61 @@ def build_teams_card(problem, rca, dt_url, rc_name, webhook_state="OPEN"):
             }
         )
 
+    # 7b. HTTP Metrikleri (4xx/5xx adet + response time max)
+    m = http_metrics or {}
+    if m and (
+        m.get("fivexx_count", 0) > 0
+        or m.get("fourxx_count", 0) > 0
+        or m.get("response_time_max_ms", 0) > 0
+    ):
+        http_facts = []
+        if m.get("fivexx_count", 0) > 0 or m.get("fivexx_peak_rate", 0) > 0:
+            http_facts.append(
+                {
+                    "title": "5xx Hata Adedi",
+                    "value": "%d istek (peak oran: %.2f%%)"
+                    % (m.get("fivexx_count", 0), m.get("fivexx_peak_rate", 0)),
+                }
+            )
+        if m.get("fourxx_count", 0) > 0 or m.get("fourxx_peak_rate", 0) > 0:
+            http_facts.append(
+                {
+                    "title": "4xx Hata Adedi",
+                    "value": "%d istek (peak oran: %.2f%%)"
+                    % (m.get("fourxx_count", 0), m.get("fourxx_peak_rate", 0)),
+                }
+            )
+        if m.get("total_errors", 0) > 0:
+            http_facts.append(
+                {"title": "Toplam Hata", "value": "%d istek" % m.get("total_errors", 0)}
+            )
+        if m.get("response_time_max_ms", 0) > 0:
+            http_facts.append(
+                {
+                    "title": "Max Yanit Suresi",
+                    "value": _format_ms(m["response_time_max_ms"] * 1000),
+                }
+            )
+        if m.get("response_time_avg_ms", 0) > 0:
+            http_facts.append(
+                {
+                    "title": "Ort Yanit Suresi",
+                    "value": _format_ms(m["response_time_avg_ms"] * 1000),
+                }
+            )
+        if http_facts:
+            rca_body.append(
+                {
+                    "type": "TextBlock",
+                    "text": "HTTP Metrikleri (4xx/5xx/Latency)",
+                    "weight": "Bolder",
+                    "size": "Small",
+                    "color": "Warning",
+                    "spacing": "Medium",
+                }
+            )
+            rca_body.append({"type": "FactSet", "facts": http_facts})
+
     # 8. Hipotezler
     rca_body.append(
         {
@@ -845,7 +1003,19 @@ def process_problem(display_id, problem_title, state, dt_url, details_text):
 
     rc_name = get_root_cause_name(problem, details_text)
     start_ts = problem.get("startTime", 0)
+    end_ts = problem.get("endTime", -1)
     logs_data = get_recent_logs(start_ts) if start_ts else []
+
+    # HTTP metrikleri: entity ID'yi problem'dan al
+    http_metrics = {}
+    entity_id = ""
+    rc_entity = problem.get("rootCauseEntity") or {}
+    if rc_entity.get("entityId", {}).get("id"):
+        entity_id = rc_entity["entityId"]["id"]
+    elif problem.get("affectedEntities"):
+        entity_id = problem["affectedEntities"][0].get("entityId", {}).get("id", "")
+    if entity_id:
+        http_metrics = get_http_metrics(entity_id, start_ts, end_ts)
 
     log.info("Claude sorgu: %s (rc: %s)", display_id, rc_name)
     rca = ask_claude(problem, details_text, logs_data, rc_name)
@@ -856,7 +1026,7 @@ def process_problem(display_id, problem_title, state, dt_url, details_text):
         bool(rca.get("pattern_analysis")),
     )
 
-    card = build_teams_card(problem, rca, dt_url, rc_name, state)
+    card = build_teams_card(problem, rca, dt_url, rc_name, state, http_metrics)
     r = requests.post(
         TEAMS_WEBHOOK,
         headers={"Content-Type": "application/json"},
@@ -905,7 +1075,7 @@ def health():
     ]
     if missing:
         return jsonify({"status": "degraded", "missing_env": missing}), 200
-    return jsonify({"status": "ok", "version": "1.5.0"}), 200
+    return jsonify({"status": "ok", "version": "1.6.0"}), 200
 
 
 @app.route("/", methods=["GET"])
