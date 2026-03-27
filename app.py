@@ -98,7 +98,7 @@ def get_http_metrics(entity_id, start_ts, end_ts):
     if not entity_id:
         return {}
     try:
-        # Zaman araligi: problem baslangicından 30 dk once → bitis + 5 dk
+        # Zaman araligi: problem baslangicından 30 dk once -> bitis + 5 dk
         if start_ts and start_ts > 0:
             from_dt = datetime.fromtimestamp(
                 max(start_ts / 1000 - 1800, 0), tz=timezone.utc
@@ -326,26 +326,29 @@ def extract_evidence_data(problem):
                     )
                 except Exception:
                     change = ""
-                ev_lines.append("  %s: %s → %s (%s)" % (ev_name, b_fmt, a_fmt, change))
+                ev_lines.append("  %s: %s -> %s (%s)" % (ev_name, b_fmt, a_fmt, change))
                 ev_card_lines.append(
-                    "%s: %s → %s (%s)" % (ev_name, b_fmt, a_fmt, change)
+                    "%s: %s -> %s (%s)" % (ev_name, b_fmt, a_fmt, change)
                 )
                 baseline_facts.append(
-                    {"title": ev_name, "value": "%s → %s (%s)" % (b_fmt, a_fmt, change)}
+                    {
+                        "title": ev_name,
+                        "value": "%s -> %s (%s)" % (b_fmt, a_fmt, change),
+                    }
                 )
             elif "PerMinute" in unit or "throughput" in ev_name.lower():
                 ev_lines.append(
-                    "  %s throughput: %.1f/dk → %.1f/dk"
+                    "  %s throughput: %.1f/dk -> %.1f/dk"
                     % (ev_name, float(before_val), float(after_val))
                 )
                 ev_card_lines.append(
-                    "%s: %.1f/dk → %.1f/dk"
+                    "%s: %.1f/dk -> %.1f/dk"
                     % (ev_name, float(before_val), float(after_val))
                 )
                 baseline_facts.append(
                     {
                         "title": ev_name,
-                        "value": "%.1f → %.1f /dk"
+                        "value": "%.1f -> %.1f /dk"
                         % (float(before_val), float(after_val)),
                     }
                 )
@@ -359,16 +362,16 @@ def extract_evidence_data(problem):
                 a_pct = float(err_cur) * 100
                 ratio = a_pct / b_pct if b_pct > 0 else 0
                 ev_lines.append(
-                    "  Hata orani: %.4f%% → %.4f%% (%.1fx artis)"
+                    "  Hata orani: %.4f%% -> %.4f%% (%.1fx artis)"
                     % (b_pct, a_pct, ratio)
                 )
                 ev_card_lines.append(
-                    "Hata orani: %.4f%% → %.4f%% (%.1fx artis)" % (b_pct, a_pct, ratio)
+                    "Hata orani: %.4f%% -> %.4f%% (%.1fx artis)" % (b_pct, a_pct, ratio)
                 )
                 baseline_facts.append(
                     {
                         "title": "Hata Orani",
-                        "value": "%.4f%% → %.4f%% (%.1fx)" % (b_pct, a_pct, ratio),
+                        "value": "%.4f%% -> %.4f%% (%.1fx)" % (b_pct, a_pct, ratio),
                     }
                 )
             except Exception:
@@ -385,17 +388,17 @@ def extract_evidence_data(problem):
                 p90_ref = float(rt_p90_ref)
                 chg = ((p90_cur - p90_ref) / p90_ref * 100) if p90_ref > 0 else 0
                 ev_lines.append(
-                    "  P90 yanit suresi: %s → %s (%+.1f%%)"
+                    "  P90 yanit suresi: %s -> %s (%+.1f%%)"
                     % (_format_ms(p90_ref), _format_ms(p90_cur), chg)
                 )
                 ev_card_lines.append(
-                    "P90: %s → %s (%+.1f%%)"
+                    "P90: %s -> %s (%+.1f%%)"
                     % (_format_ms(p90_ref), _format_ms(p90_cur), chg)
                 )
                 baseline_facts.append(
                     {
                         "title": "P90 Yanit Suresi",
-                        "value": "%s → %s (%+.1f%%)"
+                        "value": "%s -> %s (%+.1f%%)"
                         % (_format_ms(p90_ref), _format_ms(p90_cur), chg),
                     }
                 )
@@ -407,17 +410,17 @@ def extract_evidence_data(problem):
                 p50_ref = float(rt_p50_ref)
                 chg = ((p50_cur - p50_ref) / p50_ref * 100) if p50_ref > 0 else 0
                 ev_lines.append(
-                    "  P50 yanit suresi: %s → %s (%+.1f%%)"
+                    "  P50 yanit suresi: %s -> %s (%+.1f%%)"
                     % (_format_ms(p50_ref), _format_ms(p50_cur), chg)
                 )
                 ev_card_lines.append(
-                    "P50: %s → %s (%+.1f%%)"
+                    "P50: %s -> %s (%+.1f%%)"
                     % (_format_ms(p50_ref), _format_ms(p50_cur), chg)
                 )
                 baseline_facts.append(
                     {
                         "title": "P50 Yanit Suresi",
-                        "value": "%s → %s (%+.1f%%)"
+                        "value": "%s -> %s (%+.1f%%)"
                         % (_format_ms(p50_ref), _format_ms(p50_cur), chg),
                     }
                 )
@@ -478,6 +481,25 @@ def ask_claude(problem, details_text, logs, rc_name):
         "\n".join(ev_data["ev_lines"]) if ev_data["ev_lines"] else "Evidence alinamadi."
     )
 
+    # Ozel karakterleri temizle - kontrol ve sorunlu unicode karakterler prompt'u bozabilir
+    def _safe(text):
+        """Prompt icin ASCII-safe metin: sorunlu karakterleri kaldir, uzunlugu sinirla"""
+        if not text:
+            return ""
+        t = str(text)
+        # Kontrol karakterlerini kaldir (tab ve newline haric)
+        t = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", t)
+        # Non-ASCII karakterleri ASCII'ye donustur ya da kaldir
+        t = t.encode("ascii", "ignore").decode("ascii")
+        return t
+
+    evidence_block = _safe(evidence_block)[:1500]
+    downstream_block = _safe(downstream_block)[:400]
+    log_section = _safe(log_section)[:600]
+    clean_det = _safe(clean_det)[:600]
+    rc_name_safe = _safe(rc_name)[:100]
+    namespace_safe = _safe(namespace)[:60]
+
     # Prompt parcalarini guvenlice birlestir (DT verisi { } icerebildigi icin .format() yerine degisken atama)
     prompt = (
         "Sen kıdemli bir SRE ve Site Reliability Engineer'sın. "
@@ -493,11 +515,11 @@ def ask_claude(problem, details_text, logs, rc_name):
         + " | Status: "
         + problem.get("status", "N/A")
         + "\n"
-        "- Root Cause Servis: " + rc_name + "\n"
+        "- Root Cause Servis: " + rc_name_safe + "\n"
         "- Etkilenen Servisler: "
         + (", ".join(affected[:5]) if affected else "Belirsiz")
         + "\n"
-        "- Namespace: " + namespace + "\n"
+        "- Namespace: " + namespace_safe + "\n"
         "- Baslangic: "
         + (ev_data["start_str"] or "Bilinmiyor")
         + " | Bitis: "
@@ -529,7 +551,7 @@ def ask_claude(problem, details_text, logs, rc_name):
         '  "contributing_factors": ["F1: Katkida bulunan faktor", "F2: Ikinci faktor"],\n'
         '  "immediate_actions": [\n'
         '    "A1: kubectl get pods -n '
-        + namespace
+        + namespace_safe
         + ' --field-selector=status.phase!=Running ile basla",\n'
         '    "A2: Ikinci acil aksiyon - spesifik komut veya adimla",\n'
         '    "A3: Ucuncu acil aksiyon"\n'
@@ -556,7 +578,9 @@ def ask_claude(problem, details_text, logs, rc_name):
         },
         timeout=90,
     )
-    response.raise_for_status()
+    if not response.ok:
+        log.error("Claude API hata %s: %s", response.status_code, response.text[:500])
+        response.raise_for_status()
     raw = response.json()["content"][0]["text"].strip()
     if "```json" in raw:
         raw = raw.split("```json")[1].split("```")[0].strip()
@@ -1535,7 +1559,7 @@ def health():
 
 @app.route("/", methods=["GET"])
 def root():
-    return jsonify({"service": "Dynatrace RCA Bot", "version": "1.5.0"}), 200
+    return jsonify({"service": "Dynatrace RCA Bot", "version": "1.7.0"}), 200
 
 
 if __name__ == "__main__":
